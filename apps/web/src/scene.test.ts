@@ -2,6 +2,7 @@ import { Option } from 'effect'
 import {
   all,
   click,
+  doubleClick,
   expect,
   expectAll,
   given,
@@ -192,6 +193,27 @@ describe('editor view', () => {
       click(role('button', { name: 'Cancel recording for Copy selection' })),
       click(role('button', { name: 'Close settings' })),
       expect(text('Shortcut display')).toBeAbsent(),
+    )
+  })
+
+  test('double-clicking a wire inserts a reroute and opens its inspector', () => {
+    scene(
+      { update, view },
+      given(seedModel()),
+      doubleClick(selector('.graph-edge')),
+      expect(role('button', { name: 'Convert to Named Reroute' })).toExist(),
+    )
+  })
+
+  test('collapsing a selection hides members behind a container', () => {
+    scene(
+      { update, view },
+      given({ ...seedModel(), selectedNodeIds: ['n1', 'n2'] }),
+      click(role('button', { name: 'Collapse' })),
+      expect(selector('.collapsed-node')).toExist(),
+      expect(role('textbox', { name: 'Collapsed name' })).toExist(),
+      click(role('button', { name: 'Expand' })),
+      expect(selector('.collapsed-node')).toBeAbsent(),
     )
   })
 })

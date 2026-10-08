@@ -11,7 +11,7 @@
 
 import { NODE_REGISTRY, isNodeType } from '@hlsl-editor/shader-nodes'
 
-import { BASE_H, BASE_W, NODE_W, nodeHeight } from './layout'
+import { BASE_H, BASE_W, nodeHeight, nodeWidth } from './layout'
 import type { EditorNode } from './model'
 
 export function nodeLabel(node: Pick<EditorNode, 'id' | 'type'>): string {
@@ -42,7 +42,7 @@ export function defaultOnSelectNodeFit(
   const viewW = BASE_W / viewport.zoom
   const viewH = BASE_H / viewport.zoom
   return {
-    x: node.position.x + NODE_W / 2 - viewW / 2,
+    x: node.position.x + nodeWidth(node.type) / 2 - viewW / 2,
     y: node.position.y + nodeHeight(node.type) / 2 - viewH / 2,
   }
 }

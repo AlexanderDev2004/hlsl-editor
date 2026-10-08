@@ -267,4 +267,65 @@ describe("hlsl generation", () => {
       expect(res.code).toContain("float4");
     }
   });
+
+  test("a Reroute is transparent to codegen", () => {
+    const build = (withReroute: boolean) => {
+      let g = createGraph();
+      g = addNode(g, floatNode("a", 2));
+      if (withReroute) {
+        g = addNode(g, createNodeOfType("Reroute", "r", { x: 200, y: 0 }, {}));
+      }
+      g = addNode(g, outputNode("out"));
+      g = addEdge(g, {
+        id: "e1",
+        source: { nodeId: "a", port: "out" },
+        target: withReroute ? { nodeId: "r", port: "in" } : { nodeId: "out", port: "color" },
+      });
+      if (withReroute) {
+        g = addEdge(g, {
+          id: "e2",
+          source: { nodeId: "r", port: "out" },
+          target: { nodeId: "out", port: "color" },
+        });
+      }
+      return g;
+    };
+    const plain = generate(build(false));
+    const routed = generate(build(true));
+    expect(routed.ok).toBe(true);
+    if (plain.ok && routed.ok) {
+      expect(routed.code).toBe(plain.code);
+    }
+  });
+
+  test("a Named Reroute declaration/usage pair is transparent", () => {
+    let g = createGraph();
+    g = addNode(g, floatNode("a", 3));
+    g = addNode(g, createNodeOfType("NamedRerouteDeclaration", "d", { x: 100, y: 0 }, {}));
+    g = addNode(g, createNodeOfType("NamedRerouteUsage", "u", { x: 300, y: 0 }, {}));
+    g = addNode(g, outputNode("out"));
+    g = addEdge(g, {
+      id: "e1",
+      source: { nodeId: "a", port: "out" },
+      target: { nodeId: "d", port: "in" },
+    });
+    g = addEdge(g, {
+      id: "e2",
+      source: { nodeId: "d", port: "out" },
+      target: { nodeId: "u", port: "in" },
+    });
+    g = addEdge(g, {
+      id: "e3",
+      source: { nodeId: "u", port: "out" },
+      target: { nodeId: "out", port: "color" },
+    });
+    expect(validate(g)).toEqual([]);
+    const res = generate(g);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.code).toContain("float _0 = 3.0;");
+      expect(res.code).toContain("float4 _1 = float4(_0, _0, _0, _0);");
+      expect(res.code).not.toContain("_2");
+    }
+  });
 });

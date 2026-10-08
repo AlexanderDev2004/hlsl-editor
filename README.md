@@ -140,10 +140,17 @@ Connections are made by clicking an output port then an input port.
 `float -> floatN` inserts a splat constructor; `floatN -> float` is rejected
 (use Split). Invalid graphs produce structured errors and no HLSL.
 
+Reroute nodes (plain and named) are organizing constructs that are transparent
+to the compiler: the emitter assigns them no variable and resolves consumers
+straight to the upstream expression, so the generated HLSL is byte-identical to
+the same graph without them. Named-reroute declaration/usage pairs keep their
+link as a hidden edge, which lets topo sort, reachability and cycle detection
+work unchanged.
+
 ## 11. MVP 1
 
 - Nodes: Float, Float2, Float3, Float4, Add, Subtract, Multiply, Divide,
-  Split, Combine, Fragment Output.
+  Split, Combine, Reroute, Fragment Output.
 - Canvas: create, move (drag), delete, connect, select, zoom (slider/reset),
   pan (middle-drag). Left-drag on empty canvas draws a marquee that selects
   every node it overlaps. Ports are color-coded by type; invalid edges and
@@ -151,6 +158,20 @@ Connections are made by clicking an output port then an input port.
 - Add nodes from the toolbar palette, or right-click empty canvas for a
   Unreal-Blueprint-style menu: a search box plus the node list, inserting the
   chosen node at the click point.
+- Reroute nodes (Unreal-style organization): double-click a wire to insert a
+  small pass-through reroute at that point, then drag it to reshape the wire.
+  Reroutes are transparent to validation and codegen — the generated HLSL is
+  byte-identical to a direct wire. Right-click a reroute (or use its
+  Inspector) to convert it to a Named Reroute, add usages, rename it, and
+  select its usages/declaration. A named reroute keeps its link as a hidden
+  edge, so it is likewise fully transparent in the HLSL.
+- Align & Distribute: with two or more nodes selected, the node context menu
+  aligns them left/center/right and top/middle/bottom; with three or more it
+  distributes them horizontally or vertically.
+- Collapse Nodes: select nodes and press Collapse to hide them behind one
+  named container; boundary wires are re-anchored to the container while the
+  members stay in the graph, so validation and codegen are unchanged. Rename
+  it in the Inspector or Expand to restore the members.
 - Copy/paste: `Ctrl/Cmd+C` copies the selected nodes and the wires between
   them, `Ctrl/Cmd+V` pastes duplicates (fresh ids, cascading offset) and
   selects them.
@@ -183,8 +204,8 @@ Connections are made by clicking an output port then an input port.
 - Undo/redo for add, delete, move, group/ungroup, value change, connect
   (history is graph-only, capped at 100).
 - Save to browser storage, load on start, New, Export JSON, Import JSON
-  (`{version: 1, nodes, edges, outputNodeId}`).
-- 99 tests: type system, graph, validation, HLSL generation (incl.
+  (`{version: 1, nodes, edges, outputNodeId, rerouteNames, collapsed}`).
+- 114 tests: type system, graph, validation, HLSL generation (incl.
   determinism and unused-node exclusion), Foldkit story/scene tests.
 
 ## 12. MVP Roadmap
@@ -217,4 +238,7 @@ Registry + type-enum extensions only; no MVP 1 rewrites expected.
 - Pan/zoom are screen-pixel approximations; pinch/wheel gestures are not
   bound (zoom via slider/Reset button).
 - `pnpm -r test` prints PowerShell `RemoteException` noise on Windows when
-  tools write to stderr; test results themselves are authoritative (80/80).
+  tools write to stderr; test results themselves are authoritative (114/114).
+- Collapse is visual: the member nodes stay in the graph, so a collapsed
+  container re-anchors boundary wires rather than exposing its own subgraph
+  input/output ports (no collapse-to-function).

@@ -75,6 +75,15 @@ function exprFor(ir: GraphIR, node: IRNode): string {
       }
       return vecCtor(node.outType, parts);
     }
+    case "Reroute":
+    case "NamedRerouteDeclaration":
+    case "NamedRerouteUsage": {
+      const src = node.inputs["in"];
+      if (src === undefined) {
+        throw new Error(`Missing input for ${node.id}`);
+      }
+      return portRef(ir, src.fromNodeId, src.fromPort);
+    }
     case "FragmentOutput": {
       const src = node.inputs["color"];
       if (src === undefined) {
@@ -102,6 +111,19 @@ export function portRef(ir: GraphIR, fromNodeId: string, fromPort: string): stri
     // The Split variable already aliases the input vector.
     return swizzleRead(base, idx as 0 | 1 | 2 | 3);
   }
+  if (
+    node.op === "Reroute" ||
+    node.op === "NamedRerouteDeclaration" ||
+    node.op === "NamedRerouteUsage"
+  ) {
+    // Reroutes are transparent: resolve straight through to the upstream
+    // expression so the emitted code matches a direct wire.
+    const src = node.inputs["in"];
+    if (src === undefined) {
+      throw new Error(`Missing input for ${fromNodeId}`);
+    }
+    return portRef(ir, src.fromNodeId, src.fromPort);
+  }
   return base;
 }
 
@@ -119,6 +141,14 @@ export function emitHLSL(ir: GraphIR): string {
   const lines: Array<string> = [];
   for (const node of ir.nodes) {
     if (node.op === "FragmentOutput") {
+      continue;
+    }
+    if (
+      node.op === "Reroute" ||
+      node.op === "NamedRerouteDeclaration" ||
+      node.op === "NamedRerouteUsage"
+    ) {
+      // Transparent: no variable, consumers reference the upstream directly.
       continue;
     }
     lines.push(`${node.outType} ${node.variable} = ${exprFor(ir, node)};`);

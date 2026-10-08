@@ -183,6 +183,13 @@ export function upstreamPortType(
   if (node.type === "Split") {
     return "float";
   }
+  if (
+    node.type === "Reroute" ||
+    node.type === "NamedRerouteDeclaration" ||
+    node.type === "NamedRerouteUsage"
+  ) {
+    return inputActualType(graph, nodeId, "in", seen);
+  }
   if (node.type === "Combine") {
     const inputs: Record<string, HlslType> = {};
     for (const name of ["x", "y", "z", "w"]) {

@@ -4,7 +4,7 @@
 // derived from the current positions of those nodes, so it follows them as
 // they move and needs no stored geometry.
 
-import { NODE_W, nodeHeight } from './layout'
+import { nodeHeight, nodeWidth } from './layout'
 import type { EditorNode, Group } from './model'
 
 export const GROUP_PAD = 16
@@ -45,7 +45,7 @@ export function groupBounds(
   for (const node of members) {
     minX = Math.min(minX, node.position.x)
     minY = Math.min(minY, node.position.y)
-    maxX = Math.max(maxX, node.position.x + NODE_W)
+    maxX = Math.max(maxX, node.position.x + nodeWidth(node.type))
     maxY = Math.max(maxY, node.position.y + nodeHeight(node.type))
   }
   return {

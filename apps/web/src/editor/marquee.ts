@@ -6,7 +6,7 @@
 // two world corners into a rectangle and hit-test nodes against it, shared by
 // update (selection) and view (the drawn band).
 
-import { NODE_W, nodeHeight } from './layout'
+import { nodeHeight, nodeWidth } from './layout'
 import type { Model } from './model'
 
 export interface WorldRect {
@@ -36,7 +36,7 @@ export function nodesInRect(
 ): ReadonlyArray<string> {
   return model.nodes
     .filter(node => {
-      const width = NODE_W
+      const width = nodeWidth(node.type)
       const height = nodeHeight(node.type)
       return (
         node.position.x < rect.maxX &&

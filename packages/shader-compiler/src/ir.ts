@@ -3,7 +3,7 @@
 
 import type { Graph } from "@hlsl-editor/graph";
 import { incomingEdge } from "@hlsl-editor/graph";
-import { isNodeType, type NodeType } from "@hlsl-editor/shader-nodes";
+import { isNodeType, isRerouteType, type NodeType } from "@hlsl-editor/shader-nodes";
 import type { HlslType } from "@hlsl-editor/shader-types";
 
 import { upstreamPortType } from "./validate";
@@ -81,7 +81,21 @@ export function toIR(graph: Graph): GraphIR {
   dfs(outputNode.id);
 
   const varOf = new Map<string, string>();
-  order.forEach((id, i) => varOf.set(id, `_${i}`));
+  let counter = 0;
+  for (const id of order) {
+    const node = graph.nodes.find((n) => n.id === id);
+    if (node === undefined || !isNodeType(node.type)) {
+      continue;
+    }
+    // Transparent nodes (reroutes, the output) emit no variable, so the
+    // numbering downstream matches a graph without them.
+    if (node.type === "FragmentOutput" || isRerouteType(node.type)) {
+      continue;
+    }
+    varOf.set(id, `_${counter}`);
+    counter += 1;
+  }
+  const outputVar = `_${counter}`;
 
   const nodes: Array<IRNode> = [];
   for (const id of order) {
@@ -109,11 +123,11 @@ export function toIR(graph: Graph): GraphIR {
       outType,
       inputs,
       params: node.params,
-      variable: varOf.get(id) as string,
+      variable: varOf.get(id) ?? "",
     });
   }
 
-  return { nodes, outputNodeId: outputNode.id, outputVar: varOf.get(outputNode.id) as string };
+  return { nodes, outputNodeId: outputNode.id, outputVar };
 }
 
 function inputPortNames(type: NodeType): Array<string> {
@@ -132,6 +146,10 @@ function inputPortNames(type: NodeType): Array<string> {
       return ["in"];
     case "Combine":
       return ["x", "y", "z", "w"];
+    case "Reroute":
+    case "NamedRerouteDeclaration":
+    case "NamedRerouteUsage":
+      return ["in"];
     case "FragmentOutput":
       return ["color"];
   }

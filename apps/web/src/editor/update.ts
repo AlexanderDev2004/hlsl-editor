@@ -9,6 +9,7 @@ import { generate, upstreamPortType } from '@hlsl-editor/shader-compiler'
 import { NODE_REGISTRY, isNodeType } from '@hlsl-editor/shader-nodes'
 import { canConnect, connectionErrorMessage } from '@hlsl-editor/shader-types'
 
+import { hiddenNodeIds } from './collapse'
 import {
   CopyHlsl,
   DownloadJson,
@@ -19,10 +20,17 @@ import {
   PickImportFile,
 } from './commands'
 import { DEFAULT_GROUP_COLOR, GROUP_COLORS } from './groups'
-import { ZOOM_STEP, clampZoom } from './layout'
+import {
+  REROUTE_SIZE,
+  ZOOM_STEP,
+  clampZoom,
+  nodeHeight,
+  nodeWidth,
+} from './layout'
 import { nodesInRect, worldRect } from './marquee'
 import { Message } from './message'
 import {
+  type CollapsedNode,
   type EditorEdge,
   type EditorNode,
   type Group,
@@ -36,6 +44,11 @@ import {
   toDomainGraph,
 } from './model'
 import { isLoadingVariant } from './node-status'
+import {
+  declarationOfUsage,
+  isNamedRerouteLink,
+  usagesOfDeclaration,
+} from './reroutes'
 import { defaultOnSelectNodeFit } from './search'
 import {
   DEFAULT_KEYMAP,
@@ -165,6 +178,46 @@ function decodeEdge(raw: unknown): DecodedEdge | null {
   return { id: raw.id, source, target }
 }
 
+function decodeCollapsed(raw: unknown): CollapsedNode | null {
+  if (
+    !Predicate.isObject(raw) ||
+    !('id' in raw) ||
+    !('name' in raw) ||
+    !('nodeIds' in raw)
+  ) {
+    return null
+  }
+  if (
+    !Predicate.isString(raw.id) ||
+    !Predicate.isString(raw.name) ||
+    !Array.isArray(raw.nodeIds)
+  ) {
+    return null
+  }
+  const nodeIds = raw.nodeIds.filter(Predicate.isString)
+  if (nodeIds.length !== raw.nodeIds.length) {
+    return null
+  }
+  return { id: raw.id, name: raw.name, nodeIds }
+}
+
+function decodeRerouteNames(raw: unknown): Record<string, string> | null {
+  if (raw === undefined) {
+    return {}
+  }
+  if (!Predicate.isObject(raw)) {
+    return null
+  }
+  const names: Record<string, string> = {}
+  for (const [key, value] of Object.entries(raw)) {
+    if (!Predicate.isString(value)) {
+      return null
+    }
+    names[key] = value
+  }
+  return names
+}
+
 function parseGraphText(text: string):
   | {
       ok: true
@@ -173,6 +226,8 @@ function parseGraphText(text: string):
         nodes: Array<DecodedNode>
         edges: Array<DecodedEdge>
         outputNodeId: string | null
+        rerouteNames: Record<string, string>
+        collapsed: Array<CollapsedNode>
       }
     }
   | { ok: false; reason: string } {
@@ -206,6 +261,20 @@ function parseGraphText(text: string):
     'outputNodeId' in raw && Predicate.isString(raw.outputNodeId)
       ? raw.outputNodeId
       : null
+  const rerouteNames = decodeRerouteNames(
+    'rerouteNames' in raw ? raw.rerouteNames : undefined,
+  )
+  if (rerouteNames === null) {
+    return { ok: false, reason: 'Import file has invalid reroute names.' }
+  }
+  const collapsedRaw = 'collapsed' in raw ? raw.collapsed : []
+  if (!Array.isArray(collapsedRaw)) {
+    return { ok: false, reason: 'Import file has invalid collapsed groups.' }
+  }
+  const collapsed = collapsedRaw.map(decodeCollapsed)
+  if (collapsed.some(c => c === null)) {
+    return { ok: false, reason: 'Import file has an invalid collapsed group.' }
+  }
   return {
     ok: true,
     data: {
@@ -213,6 +282,8 @@ function parseGraphText(text: string):
       nodes: nodes.flatMap(n => (n === null ? [] : [n])),
       edges: edges.flatMap(e => (e === null ? [] : [e])),
       outputNodeId,
+      rerouteNames,
+      collapsed: collapsed.flatMap(c => (c === null ? [] : [c])),
     },
   }
 }
@@ -228,12 +299,16 @@ function applyImported(model: Model, text: string, pushUndo: boolean): Model {
     nodes: () => restored.nodes,
     edges: () => restored.edges,
     groups: () => [],
+    collapsed: () => restored.collapsed,
+    nextCollapsed: () => restored.nextCollapsed,
+    rerouteNames: () => restored.rerouteNames,
     outputNodeId: () => restored.outputNodeId,
     nextNode: () => restored.nextNode,
     nextEdge: () => restored.nextEdge,
     nextGroup: () => 1,
     selectedNodeIds: () => [],
     selectedGroupId: () => Option.none(),
+    selectedCollapsedId: () => Option.none(),
     pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
     status: () => `Imported graph with ${restored.nodes.length} nodes.`,
   })
@@ -246,7 +321,13 @@ function deleteSelection(model: Model): Model {
   const nodeIds = model.selectedNodeIds
   const edgeId = Option.getOrNull(model.selectedEdgeId)
   const groupId = Option.getOrNull(model.selectedGroupId)
-  if (nodeIds.length === 0 && edgeId === null && groupId === null) {
+  const collapsedId = Option.getOrNull(model.selectedCollapsedId)
+  if (
+    nodeIds.length === 0 &&
+    edgeId === null &&
+    groupId === null &&
+    collapsedId === null
+  ) {
     return withStatus(model, 'Nothing selected to delete.')
   }
   const gone = new Set(nodeIds)
@@ -263,6 +344,16 @@ function deleteSelection(model: Model): Model {
       nodeIds: group.nodeIds.filter(id => !gone.has(id)),
     }))
     .filter(group => group.nodeIds.length > 0)
+  const collapsed = model.collapsed
+    .filter(entry => entry.id !== collapsedId)
+    .map(entry => ({
+      ...entry,
+      nodeIds: entry.nodeIds.filter(id => !gone.has(id)),
+    }))
+    .filter(entry => entry.nodeIds.length > 0)
+  const rerouteNames = Object.fromEntries(
+    Object.entries(model.rerouteNames).filter(([key]) => !gone.has(key)),
+  )
   const outputId = Option.getOrNull(model.outputNodeId)
   const outputGone = outputId !== null && gone.has(outputId)
   const base = pushHistory(model)
@@ -271,15 +362,20 @@ function deleteSelection(model: Model): Model {
       ? `Deleted ${nodeIds.length} node${nodeIds.length === 1 ? '' : 's'}.`
       : groupId !== null
         ? `Deleted ${groupId}.`
-        : `Deleted edge ${edgeId ?? ''}.`
+        : collapsedId !== null
+          ? `Deleted ${collapsedId}.`
+          : `Deleted edge ${edgeId ?? ''}.`
   return modifyFields(base, {
     nodes: () => nodes,
     edges: () => edges,
     groups: () => groups,
+    collapsed: () => collapsed,
+    rerouteNames: () => rerouteNames,
     outputNodeId: () => (outputGone ? Option.none() : model.outputNodeId),
     selectedNodeIds: () => [],
     selectedEdgeId: () => Option.none(),
     selectedGroupId: () => Option.none(),
+    selectedCollapsedId: () => Option.none(),
     pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
     status: () => status,
   })
@@ -289,12 +385,17 @@ function closeContextMenu(model: Model): Model {
   return modifyFields(model, { contextMenu: () => Option.none() })
 }
 
+function dismissNodeMenu(model: Model): Model {
+  return modifyFields(model, { nodeMenu: () => Option.none() })
+}
+
 // Cancels an in-flight wire and closes the add-node menu. Escape routes here
 // when no overlay owns the key.
 function cancelPending(model: Model): Model {
   return modifyFields(model, {
     pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
     contextMenu: () => Option.none(),
+    nodeMenu: () => Option.none(),
     status: () => 'Connection cancelled.',
   })
 }
@@ -458,6 +559,407 @@ function attemptConnect(
   })
 }
 
+function nextRerouteName(model: Model): string {
+  const count = model.nodes.filter(
+    node => node.type === 'NamedRerouteDeclaration',
+  ).length
+  return `Reroute ${count + 1}`
+}
+
+function insertRerouteOnEdge(
+  model: Model,
+  edgeId: string,
+  worldX: number,
+  worldY: number,
+): Model {
+  const edge = model.edges.find(e => e.id === edgeId)
+  if (edge === undefined) {
+    return withStatus(model, 'No wire to split.')
+  }
+  const id = `n${model.nextNode}`
+  const node: EditorNode = {
+    id,
+    type: 'Reroute',
+    position: { x: worldX - REROUTE_SIZE / 2, y: worldY - REROUTE_SIZE / 2 },
+    params: {},
+  }
+  const into: EditorEdge = {
+    id: `e${model.nextEdge}`,
+    sourceNodeId: edge.sourceNodeId,
+    sourcePort: edge.sourcePort,
+    targetNodeId: id,
+    targetPort: 'in',
+  }
+  const outOf: EditorEdge = {
+    id: `e${model.nextEdge + 1}`,
+    sourceNodeId: id,
+    sourcePort: 'out',
+    targetNodeId: edge.targetNodeId,
+    targetPort: edge.targetPort,
+  }
+  const base = pushHistory(model)
+  return modifyFields(base, {
+    nodes: () => [...model.nodes, node],
+    edges: () => [...model.edges.filter(e => e.id !== edgeId), into, outOf],
+    nextNode: () => model.nextNode + 1,
+    nextEdge: () => model.nextEdge + 2,
+    selectedNodeIds: () => [id],
+    selectedEdgeId: () => Option.none(),
+    status: () => `Inserted reroute ${id}.`,
+  })
+}
+
+// Replaces a plain Reroute with a declaration/usage pair joined by a hidden
+// link edge. The declaration takes the reroute's input, the usage its outputs.
+function convertRerouteToNamed(model: Model, nodeId: string): Model {
+  const node = model.nodes.find(n => n.id === nodeId)
+  if (node === undefined || node.type !== 'Reroute') {
+    return withStatus(model, 'Select a reroute to convert.')
+  }
+  const declarationId = `n${model.nextNode}`
+  const usageId = `n${model.nextNode + 1}`
+  const declaration: EditorNode = {
+    id: declarationId,
+    type: 'NamedRerouteDeclaration',
+    position: { ...node.position },
+    params: {},
+  }
+  const usage: EditorNode = {
+    id: usageId,
+    type: 'NamedRerouteUsage',
+    position: {
+      x: node.position.x + REROUTE_SIZE + 40,
+      y: node.position.y,
+    },
+    params: {},
+  }
+  const link: EditorEdge = {
+    id: `e${model.nextEdge}`,
+    sourceNodeId: declarationId,
+    sourcePort: 'out',
+    targetNodeId: usageId,
+    targetPort: 'in',
+  }
+  const edges = model.edges.flatMap(edge => {
+    if (edge.targetNodeId === nodeId && edge.targetPort === 'in') {
+      return [{ ...edge, targetNodeId: declarationId, targetPort: 'in' }]
+    }
+    if (edge.sourceNodeId === nodeId && edge.sourcePort === 'out') {
+      return [{ ...edge, sourceNodeId: usageId, sourcePort: 'out' }]
+    }
+    return [edge]
+  })
+  const base = pushHistory(model)
+  const rerouteNames = {
+    ...model.rerouteNames,
+    [declarationId]: nextRerouteName(model),
+  }
+  return modifyFields(base, {
+    nodes: () => [
+      ...model.nodes.filter(n => n.id !== nodeId),
+      declaration,
+      usage,
+    ],
+    edges: () => [...edges, link],
+    nextNode: () => model.nextNode + 2,
+    nextEdge: () => model.nextEdge + 1,
+    rerouteNames: () => rerouteNames,
+    selectedNodeIds: () => [usageId],
+    selectedEdgeId: () => Option.none(),
+    status: () => `Converted ${nodeId} to named reroute ${declarationId}.`,
+  })
+}
+
+// Collapses a declaration/usage pair back into a single Reroute.
+function convertNamedRerouteToReroute(model: Model, nodeId: string): Model {
+  const node = model.nodes.find(n => n.id === nodeId)
+  if (node === undefined) {
+    return model
+  }
+  if (
+    node.type !== 'NamedRerouteDeclaration' &&
+    node.type !== 'NamedRerouteUsage'
+  ) {
+    return withStatus(model, 'Select a named reroute to convert.')
+  }
+  const declarationId =
+    node.type === 'NamedRerouteDeclaration'
+      ? nodeId
+      : declarationOfUsage(model, nodeId)
+  if (declarationId === null) {
+    return withStatus(model, 'This usage has no declaration.')
+  }
+  const usages = usagesOfDeclaration(model, declarationId)
+  const usageId = usages[0]
+  if (usageId === undefined) {
+    return withStatus(model, 'This declaration has no usage.')
+  }
+  if (usages.length > 1) {
+    return withStatus(
+      model,
+      'This reroute has multiple usages; delete the extras before converting.',
+    )
+  }
+  const rerouteId = `n${model.nextNode}`
+  const declaration = model.nodes.find(n => n.id === declarationId)
+  const reroute: EditorNode = {
+    id: rerouteId,
+    type: 'Reroute',
+    position: declaration?.position ?? node.position,
+    params: {},
+  }
+  const removed = new Set([declarationId, usageId])
+  const edges = model.edges.flatMap(edge => {
+    if (isNamedRerouteLink(model, edge)) {
+      return []
+    }
+    if (edge.targetNodeId === declarationId) {
+      return [{ ...edge, targetNodeId: rerouteId, targetPort: 'in' }]
+    }
+    if (edge.sourceNodeId === usageId) {
+      return [{ ...edge, sourceNodeId: rerouteId, sourcePort: 'out' }]
+    }
+    return [edge]
+  })
+  const names = Object.fromEntries(
+    Object.entries(model.rerouteNames).filter(([key]) => key !== declarationId),
+  )
+  const base = pushHistory(model)
+  return modifyFields(base, {
+    nodes: () => [...model.nodes.filter(n => !removed.has(n.id)), reroute],
+    edges: () => edges,
+    nextNode: () => model.nextNode + 1,
+    rerouteNames: () => names,
+    selectedNodeIds: () => [rerouteId],
+    selectedEdgeId: () => Option.none(),
+    status: () => `Converted ${declarationId} to a plain reroute.`,
+  })
+}
+
+function addNamedRerouteUsage(model: Model, declarationId: string): Model {
+  const declaration = model.nodes.find(
+    n => n.id === declarationId && n.type === 'NamedRerouteDeclaration',
+  )
+  if (declaration === undefined) {
+    return withStatus(model, 'Select a reroute declaration first.')
+  }
+  const usageId = `n${model.nextNode}`
+  const usage: EditorNode = {
+    id: usageId,
+    type: 'NamedRerouteUsage',
+    position: { x: declaration.position.x, y: declaration.position.y + 80 },
+    params: {},
+  }
+  const link: EditorEdge = {
+    id: `e${model.nextEdge}`,
+    sourceNodeId: declarationId,
+    sourcePort: 'out',
+    targetNodeId: usageId,
+    targetPort: 'in',
+  }
+  const base = pushHistory(model)
+  return modifyFields(base, {
+    nodes: () => [...model.nodes, usage],
+    edges: () => [...model.edges, link],
+    nextNode: () => model.nextNode + 1,
+    nextEdge: () => model.nextEdge + 1,
+    selectedNodeIds: () => [usageId],
+    status: () => `Added usage ${usageId}.`,
+  })
+}
+
+function renameReroute(
+  model: Model,
+  declarationId: string,
+  name: string,
+): Model {
+  if (model.nodes.every(n => n.id !== declarationId)) {
+    return model
+  }
+  const rerouteNames = { ...model.rerouteNames, [declarationId]: name }
+  return modifyFields(model, {
+    rerouteNames: () => rerouteNames,
+  })
+}
+
+function selectRerouteUsages(model: Model, declarationId: string): Model {
+  const usages = usagesOfDeclaration(model, declarationId)
+  if (usages.length === 0) {
+    return withStatus(model, 'This reroute has no usages.')
+  }
+  return modifyFields(model, {
+    selectedNodeIds: () => usages,
+    selectedEdgeId: () => Option.none(),
+    selectedGroupId: () => Option.none(),
+    status: () =>
+      `Selected ${usages.length} usage${usages.length === 1 ? '' : 's'}.`,
+  })
+}
+
+function selectRerouteDeclaration(model: Model, usageId: string): Model {
+  const declarationId = declarationOfUsage(model, usageId)
+  if (declarationId === null) {
+    return withStatus(model, 'This usage has no declaration.')
+  }
+  return modifyFields(model, {
+    selectedNodeIds: () => [declarationId],
+    selectedEdgeId: () => Option.none(),
+    selectedGroupId: () => Option.none(),
+    status: () => `Selected declaration ${declarationId}.`,
+  })
+}
+
+// ALIGN & DISTRIBUTE (Unreal-style)
+
+function alignNodes(model: Model, mode: string): Model {
+  const selected = model.nodes.filter(n => model.selectedNodeIds.includes(n.id))
+  if (selected.length < 2) {
+    return withStatus(model, 'Select at least two nodes to align.')
+  }
+  const left = Math.min(...selected.map(n => n.position.x))
+  const right = Math.max(...selected.map(n => n.position.x + nodeWidth(n.type)))
+  const top = Math.min(...selected.map(n => n.position.y))
+  const bottom = Math.max(
+    ...selected.map(n => n.position.y + nodeHeight(n.type)),
+  )
+  const aligners: Record<string, (n: EditorNode) => { x: number; y: number }> =
+    {
+      left: n => ({ x: left, y: n.position.y }),
+      right: n => ({ x: right - nodeWidth(n.type), y: n.position.y }),
+      top: n => ({ x: n.position.x, y: top }),
+      bottom: n => ({ x: n.position.x, y: bottom - nodeHeight(n.type) }),
+      centerX: n => ({
+        x: (left + right) / 2 - nodeWidth(n.type) / 2,
+        y: n.position.y,
+      }),
+      centerY: n => ({
+        x: n.position.x,
+        y: (top + bottom) / 2 - nodeHeight(n.type) / 2,
+      }),
+    }
+  const aligner = aligners[mode]
+  if (aligner === undefined) {
+    return model
+  }
+  const base = pushHistory(model)
+  return modifyFields(base, {
+    nodes: () =>
+      model.nodes.map(n =>
+        model.selectedNodeIds.includes(n.id)
+          ? { ...n, position: aligner(n) }
+          : n,
+      ),
+    status: () => `Aligned ${selected.length} nodes (${mode}).`,
+  })
+}
+
+function distributeNodes(model: Model, axis: string): Model {
+  const horizontal = axis === 'horizontal'
+  const selected = model.nodes.filter(n => model.selectedNodeIds.includes(n.id))
+  if (selected.length < 3) {
+    return withStatus(model, 'Select at least three nodes to distribute.')
+  }
+  const center = (n: EditorNode): number =>
+    horizontal
+      ? n.position.x + nodeWidth(n.type) / 2
+      : n.position.y + nodeHeight(n.type) / 2
+  const sorted = [...selected].sort((a, b) => center(a) - center(b))
+  const centers = sorted.map(center)
+  const start = centers[0] ?? 0
+  const end = centers[centers.length - 1] ?? 0
+  const step = (end - start) / (sorted.length - 1)
+  const placed = new Map(sorted.map((n, i) => [n.id, start + step * i]))
+  const base = pushHistory(model)
+  return modifyFields(base, {
+    nodes: () =>
+      model.nodes.map(n => {
+        const c = placed.get(n.id)
+        if (c === undefined) {
+          return n
+        }
+        return horizontal
+          ? {
+              ...n,
+              position: { x: c - nodeWidth(n.type) / 2, y: n.position.y },
+            }
+          : {
+              ...n,
+              position: { x: n.position.x, y: c - nodeHeight(n.type) / 2 },
+            }
+      }),
+    status: () => `Distributed ${selected.length} nodes (${axis}).`,
+  })
+}
+
+// COLLAPSE NODES
+//
+// The members stay in the graph (validation and codegen are unchanged); the
+// view hides them behind one container and reroutes boundary wires to it.
+
+function collapseSelection(model: Model): Model {
+  const members = model.selectedNodeIds
+  if (members.length === 0) {
+    return withStatus(model, 'Select nodes to collapse first.')
+  }
+  const id = `c${model.nextCollapsed}`
+  const collapsed: CollapsedNode = {
+    id,
+    name: `Collapsed ${model.nextCollapsed}`,
+    nodeIds: [...members],
+  }
+  const existing = model.collapsed
+    .map(entry => ({
+      ...entry,
+      nodeIds: entry.nodeIds.filter(nodeId => !members.includes(nodeId)),
+    }))
+    .filter(entry => entry.nodeIds.length > 0)
+  const base = pushHistory(model)
+  return modifyFields(base, {
+    collapsed: () => [...existing, collapsed],
+    nextCollapsed: () => model.nextCollapsed + 1,
+    selectedCollapsedId: () => Option.some(id),
+    selectedNodeIds: () => [],
+    status: () =>
+      `Collapsed ${members.length} node${members.length === 1 ? '' : 's'} into ${id}.`,
+  })
+}
+
+function expandCollapsed(model: Model, collapsedId: string): Model {
+  const entry = model.collapsed.find(c => c.id === collapsedId)
+  if (entry === undefined) {
+    return model
+  }
+  const base = pushHistory(model)
+  return modifyFields(base, {
+    collapsed: () => model.collapsed.filter(c => c.id !== collapsedId),
+    selectedCollapsedId: () => Option.none(),
+    status: () => `Expanded ${entry.name}.`,
+  })
+}
+
+function renameCollapsed(
+  model: Model,
+  collapsedId: string,
+  name: string,
+): Model {
+  return modifyFields(model, {
+    collapsed: () =>
+      model.collapsed.map(c => (c.id === collapsedId ? { ...c, name } : c)),
+  })
+}
+
+function selectCollapsed(model: Model, collapsedId: string): Model {
+  if (model.collapsed.every(c => c.id !== collapsedId)) {
+    return model
+  }
+  return modifyFields(model, {
+    selectedCollapsedId: () => Option.some(collapsedId),
+    selectedNodeIds: () => [],
+    selectedGroupId: () => Option.none(),
+    status: () => `Selected ${collapsedId}.`,
+  })
+}
+
 export const update = (model: Model, message: Message): UpdateReturn =>
   Message.match<UpdateReturn>(message, {
     RequestedAddNode: ({ x, y }) => ({
@@ -510,6 +1012,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       model: modifyFields(model, {
         selectedNodeIds: () => [nodeId],
         contextMenu: () => Option.none(),
+        nodeMenu: () => Option.none(),
         drag: () => ({
           mode: 'node',
           nodeId,
@@ -523,6 +1026,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
     StartedPan: ({ x, y }) => ({
       model: modifyFields(model, {
         contextMenu: () => Option.none(),
+        nodeMenu: () => Option.none(),
         drag: () => ({
           mode: 'pan',
           lastX: x,
@@ -692,7 +1196,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
             drag.currentWorldX,
             drag.currentWorldY,
           ),
-        )
+        ).filter(id => !hiddenNodeIds(model).has(id))
         return {
           model: modifyFields(model, {
             drag: () => ({ mode: 'idle' }),
@@ -770,6 +1274,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           selectedNodeIds: () => [],
           selectedEdgeId: () => Option.none(),
           pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
+          nodeMenu: () => Option.none(),
         }),
       }
     },
@@ -1055,9 +1560,11 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       model: modifyFields(model, {
         contextMenu: () =>
           Option.some({ worldX, worldY, clientX, clientY, search: '' }),
+        nodeMenu: () => Option.none(),
         selectedNodeIds: () => [],
         selectedEdgeId: () => Option.none(),
         selectedGroupId: () => Option.none(),
+        selectedCollapsedId: () => Option.none(),
         pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
       }),
     }),
@@ -1134,6 +1641,52 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       model: modifyFields(model, {
         minimapVisible: () => !model.minimapVisible,
       }),
+    }),
+    InsertedRerouteOnEdge: ({ edgeId, worldX, worldY }) => ({
+      model: insertRerouteOnEdge(model, edgeId, worldX, worldY),
+    }),
+    ConvertedRerouteToNamed: ({ nodeId }) => ({
+      model: dismissNodeMenu(convertRerouteToNamed(model, nodeId)),
+    }),
+    ConvertedNamedRerouteToReroute: ({ nodeId }) => ({
+      model: dismissNodeMenu(convertNamedRerouteToReroute(model, nodeId)),
+    }),
+    AddedNamedRerouteUsage: ({ declarationId }) => ({
+      model: dismissNodeMenu(addNamedRerouteUsage(model, declarationId)),
+    }),
+    RenamedReroute: ({ declarationId, name }) => ({
+      model: renameReroute(model, declarationId, name),
+    }),
+    SelectedRerouteUsages: ({ declarationId }) => ({
+      model: dismissNodeMenu(selectRerouteUsages(model, declarationId)),
+    }),
+    SelectedRerouteDeclaration: ({ usageId }) => ({
+      model: dismissNodeMenu(selectRerouteDeclaration(model, usageId)),
+    }),
+    AlignedNodes: ({ mode }) => ({
+      model: dismissNodeMenu(alignNodes(model, mode)),
+    }),
+    DistributedNodes: ({ axis }) => ({
+      model: dismissNodeMenu(distributeNodes(model, axis)),
+    }),
+    CollapsedSelection: () => ({ model: collapseSelection(model) }),
+    ExpandedCollapsed: ({ collapsedId }) => ({
+      model: expandCollapsed(model, collapsedId),
+    }),
+    RenamedCollapsed: ({ collapsedId, name }) => ({
+      model: renameCollapsed(model, collapsedId, name),
+    }),
+    SelectedCollapsed: ({ collapsedId }) => ({
+      model: selectCollapsed(model, collapsedId),
+    }),
+    OpenedNodeMenu: ({ nodeId, clientX, clientY }) => ({
+      model: modifyFields(model, {
+        nodeMenu: () => Option.some({ nodeId, clientX, clientY }),
+        contextMenu: () => Option.none(),
+      }),
+    }),
+    DismissedNodeMenu: () => ({
+      model: modifyFields(model, { nodeMenu: () => Option.none() }),
     }),
     UpdatedParam: ({ nodeId, key, valueText }) => {
       const value = Number.parseFloat(valueText)
@@ -1233,10 +1786,21 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         }
       })
       const base = pushHistory(model)
+      const pastedNames = Object.fromEntries(
+        clip.nodes.flatMap(node => {
+          const name = model.rerouteNames[node.id]
+          const mapped = idMap.get(node.id)
+          return name !== undefined && mapped !== undefined
+            ? [[mapped, name]]
+            : []
+        }),
+      )
+      const rerouteNames = { ...model.rerouteNames, ...pastedNames }
       return {
         model: modifyFields(base, {
           nodes: () => [...model.nodes, ...newNodes],
           edges: () => [...model.edges, ...newEdges],
+          rerouteNames: () => rerouteNames,
           nextNode: () => nextNode,
           nextEdge: () => nextEdge,
           selectedNodeIds: () => newNodes.map(node => node.id),
@@ -1316,6 +1880,8 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           nodes: model.nodes,
           edges: model.edges,
           outputNodeId: Option.getOrNull(model.outputNodeId),
+          rerouteNames: model.rerouteNames,
+          collapsed: model.collapsed,
         },
         null,
         2,
@@ -1341,12 +1907,16 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           nodes: () => restored.nodes,
           edges: () => restored.edges,
           groups: () => [],
+          collapsed: () => restored.collapsed,
+          nextCollapsed: () => restored.nextCollapsed,
+          rerouteNames: () => restored.rerouteNames,
           outputNodeId: () => restored.outputNodeId,
           nextNode: () => restored.nextNode,
           nextEdge: () => restored.nextEdge,
           nextGroup: () => 1,
           selectedNodeIds: () => [],
           selectedGroupId: () => Option.none(),
+          selectedCollapsedId: () => Option.none(),
           status: () =>
             `Loaded saved graph with ${restored.nodes.length} nodes.`,
         }),
@@ -1374,12 +1944,16 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           nodes: () => [],
           edges: () => [],
           groups: () => [],
+          collapsed: () => [],
+          nextCollapsed: () => 1,
+          rerouteNames: () => ({}),
           outputNodeId: () => Option.none(),
           nextNode: () => 1,
           nextEdge: () => 1,
           nextGroup: () => 1,
           selectedNodeIds: () => [],
           selectedGroupId: () => Option.none(),
+          selectedCollapsedId: () => Option.none(),
           pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
           status: () => 'New graph. Add nodes from the palette.',
         }),
@@ -1392,6 +1966,8 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           nodes: model.nodes,
           edges: model.edges,
           outputNodeId: Option.getOrNull(model.outputNodeId),
+          rerouteNames: model.rerouteNames,
+          collapsed: model.collapsed,
         },
         null,
         2,

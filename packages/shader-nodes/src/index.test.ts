@@ -15,10 +15,20 @@ describe("shader-nodes", () => {
       "Divide",
       "Split",
       "Combine",
+      "Reroute",
+      "NamedRerouteDeclaration",
+      "NamedRerouteUsage",
       "FragmentOutput",
     ] as const) {
       expect(NODE_REGISTRY[t]).toBeDefined();
     }
+  });
+
+  test("reroute output passes the input type through", () => {
+    expect(resolveOutputType("Reroute", { in: "float3" })).toBe("float3");
+    expect(resolveOutputType("Reroute", {})).toBeNull();
+    expect(resolveOutputType("NamedRerouteDeclaration", { in: "float2" })).toBe("float2");
+    expect(resolveOutputType("NamedRerouteUsage", { in: "float4" })).toBe("float4");
   });
 
   test("math output is the wider input", () => {

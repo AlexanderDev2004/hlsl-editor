@@ -9,17 +9,21 @@ import {
   NODE_REGISTRY,
   NODE_TYPES,
   isNodeType,
+  isRerouteType,
 } from '@hlsl-editor/shader-nodes'
 
+import { collapsedBounds, hiddenNodeIds } from './collapse'
 import { GROUP_COLORS, GROUP_HEADER, GROUP_PAD, groupBounds } from './groups'
 import {
   BASE_H,
   BASE_W,
   HEADER_H,
   NODE_W,
+  REROUTE_SIZE,
   ZOOM_MAX,
   ZOOM_MIN,
   nodeHeight,
+  nodeWidth,
   portY,
 } from './layout'
 import { nodesInRect, worldRect } from './marquee'
@@ -31,13 +35,20 @@ import {
   minimapTransform,
   sceneBounds,
 } from './minimap'
-import { type EditorNode, type Group, type Model, toDomainGraph } from './model'
+import {
+  type CollapsedNode,
+  type EditorNode,
+  type Group,
+  type Model,
+  toDomainGraph,
+} from './model'
 import {
   LOADING_VARIANTS,
   type LoadingVariant,
   type NodeStatus,
   deriveNodeStatuses,
 } from './node-status'
+import { declarationOfUsage, isNamedRerouteLink, rerouteName } from './reroutes'
 import { defaultOnSearch, nodeLabel } from './search'
 import {
   SHORTCUT_CATEGORIES,
@@ -64,7 +75,7 @@ function portPosition(
     return null
   }
   return {
-    x: node.position.x + (direction === 'in' ? 0 : NODE_W),
+    x: node.position.x + (direction === 'in' ? 0 : nodeWidth(node.type)),
     y: node.position.y + portY(node.type, index),
   }
 }
@@ -112,6 +123,12 @@ const TYPE_COLORS: Record<string, string> = {
   float3: '#d29922',
   float4: '#f778ba',
 }
+
+// Named reroute declarations/usages are created through the reroute actions,
+// never dropped in standalone (a lone usage has no declaration to link to).
+const PALETTE_TYPES = NODE_TYPES.filter(
+  type => type !== 'NamedRerouteDeclaration' && type !== 'NamedRerouteUsage',
+)
 
 function typeColor(type: string): string {
   return TYPE_COLORS[type] ?? '#8b949e'
@@ -296,7 +313,7 @@ function headerView(
           h.Class('bg-neutral-800 border border-neutral-700 rounded px-2 py-1'),
           h.AriaLabel('Node type to add'),
         ],
-        NODE_TYPES.map(t =>
+        PALETTE_TYPES.map(t =>
           h.option([h.Value(t)], [isNodeType(t) ? NODE_REGISTRY[t].label : t]),
         ),
       ),
@@ -386,6 +403,16 @@ function headerView(
           h.Title('Ungroup selected group (Ctrl/Cmd+Shift+G)'),
         ],
         ['Ungroup'],
+      ),
+      h.button(
+        [
+          h.OnClick(Message.CollapsedSelection()),
+          h.Class(
+            'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-3 py-1',
+          ),
+          h.Title('Collapse selected nodes into a container'),
+        ],
+        ['Collapse'],
       ),
       h.button(
         [
@@ -661,6 +688,17 @@ function canvasView(
     ...highlightedNodeIds(model),
     ...(marquee !== null ? nodesInRect(model, marquee) : []),
   ])
+  const hidden = hiddenNodeIds(model)
+  const collapsedRects = model.collapsed.flatMap(entry => {
+    const rect = collapsedBounds(entry, model.nodes)
+    return rect === null ? [] : [{ entry, rect }]
+  })
+  const nodeContainer = collapsedRects.reduce<
+    Map<string, { x: number; y: number; width: number; height: number }>
+  >((acc, { entry, rect }) => {
+    entry.nodeIds.forEach(id => acc.set(id, rect))
+    return acc
+  }, new Map())
   const w = BASE_W / model.viewport.zoom
   const ww = BASE_H / model.viewport.zoom
   return h.div(
@@ -877,14 +915,88 @@ function canvasView(
               ),
             ]
           }),
+          ...collapsedRects.map(({ entry, rect }) => {
+            const selected =
+              Option.getOrNull(model.selectedCollapsedId) === entry.id
+            return h.g(
+              [h.Class('collapsed-node')],
+              [
+                h.rect([
+                  h.X(String(rect.x)),
+                  h.Y(String(rect.y)),
+                  h.Width(String(rect.width)),
+                  h.Height(String(rect.height)),
+                  h.Rx('10'),
+                  h.Fill('#1f2937'),
+                  h.FillOpacity('0.55'),
+                  h.Stroke(selected ? '#58a6ff' : '#6b7280'),
+                  h.StrokeWidth(selected ? '2.5' : '1.5'),
+                  h.Cursor('pointer'),
+                  h.OnClick(
+                    Message.SelectedCollapsed({ collapsedId: entry.id }),
+                  ),
+                ]),
+                h.rect([
+                  h.X(String(rect.x)),
+                  h.Y(String(rect.y)),
+                  h.Width(String(rect.width)),
+                  h.Height('24'),
+                  h.Rx('10'),
+                  h.Fill('#6b7280'),
+                  h.FillOpacity('0.35'),
+                  h.PointerEvents('none'),
+                ]),
+                h.text(
+                  [
+                    h.X(String(rect.x + 8)),
+                    h.Y(String(rect.y + 16)),
+                    h.Fill('#f0f6fc'),
+                    h.FontSize('12'),
+                    h.FontWeight('600'),
+                    h.PointerEvents('none'),
+                  ],
+                  [entry.name],
+                ),
+                h.text(
+                  [
+                    h.X(String(rect.x + 8)),
+                    h.Y(String(rect.y + rect.height - 8)),
+                    h.Fill('#9ca3af'),
+                    h.FontSize('11'),
+                    h.PointerEvents('none'),
+                  ],
+                  [
+                    `${entry.nodeIds.length} node${entry.nodeIds.length === 1 ? '' : 's'} collapsed`,
+                  ],
+                ),
+              ],
+            )
+          }),
           ...model.edges.flatMap(edge => {
+            if (isNamedRerouteLink(model, edge)) {
+              return []
+            }
             const from = model.nodes.find(n => n.id === edge.sourceNodeId)
             const to = model.nodes.find(n => n.id === edge.targetNodeId)
             if (from === undefined || to === undefined) {
               return []
             }
-            const p1 = portPosition(from, edge.sourcePort, 'out')
-            const p2 = portPosition(to, edge.targetPort, 'in')
+            const fromBox = nodeContainer.get(edge.sourceNodeId)
+            const toBox = nodeContainer.get(edge.targetNodeId)
+            if (fromBox !== undefined && toBox !== undefined) {
+              return []
+            }
+            const p1 =
+              fromBox !== undefined
+                ? {
+                    x: fromBox.x + fromBox.width,
+                    y: fromBox.y + fromBox.height / 2,
+                  }
+                : portPosition(from, edge.sourcePort, 'out')
+            const p2 =
+              toBox !== undefined
+                ? { x: toBox.x, y: toBox.y + toBox.height / 2 }
+                : portPosition(to, edge.targetPort, 'in')
             if (p1 === null || p2 === null) {
               return []
             }
@@ -910,6 +1022,13 @@ function canvasView(
                 h.Cursor('pointer'),
                 h.Class('graph-edge'),
                 h.OnClick(Message.SelectedEdge({ edgeId: edge.id })),
+                h.OnDoubleClick(
+                  Message.InsertedRerouteOnEdge({
+                    edgeId: edge.id,
+                    worldX: (p1.x + p2.x) / 2,
+                    worldY: (p1.y + p2.y) / 2,
+                  }),
+                ),
                 h.OnMouseEnter(Message.HoveredEdge({ edgeId: edge.id })),
                 h.OnMouseLeave(Message.UnhoveredEdge({ edgeId: edge.id })),
               ]),
@@ -922,19 +1041,24 @@ function canvasView(
               ]),
             ]
           }),
-          ...model.nodes.map(node =>
-            nodeView(
-              model,
-              h,
-              node,
-              nodeStatuses.get(node.id) ?? 'initial',
-              highlightedNodes.has(node.id),
-            ),
+          ...model.nodes.flatMap(node =>
+            hidden.has(node.id)
+              ? []
+              : [
+                  nodeView(
+                    model,
+                    h,
+                    node,
+                    nodeStatuses.get(node.id) ?? 'initial',
+                    highlightedNodes.has(node.id),
+                  ),
+                ],
           ),
         ],
       ),
       minimapView(model, h),
       contextMenuView(model, h),
+      nodeMenuView(model, h),
     ],
   )
 }
@@ -1000,6 +1124,9 @@ function minimapView(model: Model, h: HtmlBuilder<Message>): Html {
         ],
         [
           ...model.edges.flatMap(edge => {
+            if (isNamedRerouteLink(model, edge)) {
+              return []
+            }
             const from = model.nodes.find(n => n.id === edge.sourceNodeId)
             const to = model.nodes.find(n => n.id === edge.targetNodeId)
             if (from === undefined || to === undefined) {
@@ -1007,7 +1134,7 @@ function minimapView(model: Model, h: HtmlBuilder<Message>): Html {
             }
             return [
               h.line([
-                h.X1(mx(from.position.x + NODE_W)),
+                h.X1(mx(from.position.x + nodeWidth(from.type))),
                 h.Y1(my(from.position.y + nodeHeight(from.type) / 2)),
                 h.X2(mx(to.position.x)),
                 h.Y2(my(to.position.y + nodeHeight(to.type) / 2)),
@@ -1016,17 +1143,25 @@ function minimapView(model: Model, h: HtmlBuilder<Message>): Html {
               ]),
             ]
           }),
-          ...model.nodes.map(node =>
-            h.rect([
-              h.X(mx(node.position.x)),
-              h.Y(my(node.position.y)),
-              h.Width(String(Math.max(NODE_W * t.scale, 3))),
-              h.Height(String(Math.max(nodeHeight(node.type) * t.scale, 2))),
-              h.Rx('1'),
-              h.Fill('#30363d'),
-              h.Stroke('#58a6ff'),
-              h.StrokeWidth('0.5'),
-            ]),
+          ...model.nodes.flatMap(node =>
+            hiddenNodeIds(model).has(node.id)
+              ? []
+              : [
+                  h.rect([
+                    h.X(mx(node.position.x)),
+                    h.Y(my(node.position.y)),
+                    h.Width(
+                      String(Math.max(nodeWidth(node.type) * t.scale, 3)),
+                    ),
+                    h.Height(
+                      String(Math.max(nodeHeight(node.type) * t.scale, 2)),
+                    ),
+                    h.Rx('1'),
+                    h.Fill('#30363d'),
+                    h.Stroke('#58a6ff'),
+                    h.StrokeWidth('0.5'),
+                  ]),
+                ],
           ),
           h.rect([
             h.X(mx(model.viewport.x)),
@@ -1050,7 +1185,7 @@ function contextMenuView(model: Model, h: HtmlBuilder<Message>): Html {
     return h.empty
   }
   const query = menu.search.trim().toLowerCase()
-  const types = NODE_TYPES.filter(type => {
+  const types = PALETTE_TYPES.filter(type => {
     if (query === '') {
       return true
     }
@@ -1111,6 +1246,215 @@ function contextMenuView(model: Model, h: HtmlBuilder<Message>): Html {
   )
 }
 
+function nodeMenuView(model: Model, h: HtmlBuilder<Message>): Html {
+  const menu = Option.getOrNull(model.nodeMenu)
+  if (menu === null) {
+    return h.empty
+  }
+  const node = model.nodes.find(n => n.id === menu.nodeId)
+  if (node === undefined) {
+    return h.empty
+  }
+  const actions: Array<{ label: string; message: Message }> = []
+  if (node.type === 'Reroute') {
+    actions.push({
+      label: 'Convert to Named Reroute',
+      message: Message.ConvertedRerouteToNamed({ nodeId: node.id }),
+    })
+  }
+  if (node.type === 'NamedRerouteDeclaration') {
+    actions.push({
+      label: 'Add Usage',
+      message: Message.AddedNamedRerouteUsage({ declarationId: node.id }),
+    })
+    actions.push({
+      label: 'Select Usages',
+      message: Message.SelectedRerouteUsages({ declarationId: node.id }),
+    })
+    actions.push({
+      label: 'Convert to Reroute',
+      message: Message.ConvertedNamedRerouteToReroute({ nodeId: node.id }),
+    })
+  }
+  if (node.type === 'NamedRerouteUsage') {
+    actions.push({
+      label: 'Select Declaration',
+      message: Message.SelectedRerouteDeclaration({ usageId: node.id }),
+    })
+    actions.push({
+      label: 'Convert to Reroute',
+      message: Message.ConvertedNamedRerouteToReroute({ nodeId: node.id }),
+    })
+  }
+  if (model.selectedNodeIds.length >= 2) {
+    actions.push(
+      { label: 'Align left', message: Message.AlignedNodes({ mode: 'left' }) },
+      {
+        label: 'Align center',
+        message: Message.AlignedNodes({ mode: 'centerX' }),
+      },
+      {
+        label: 'Align right',
+        message: Message.AlignedNodes({ mode: 'right' }),
+      },
+      { label: 'Align top', message: Message.AlignedNodes({ mode: 'top' }) },
+      {
+        label: 'Align middle',
+        message: Message.AlignedNodes({ mode: 'centerY' }),
+      },
+      {
+        label: 'Align bottom',
+        message: Message.AlignedNodes({ mode: 'bottom' }),
+      },
+    )
+  }
+  if (model.selectedNodeIds.length >= 3) {
+    actions.push(
+      {
+        label: 'Distribute horizontally',
+        message: Message.DistributedNodes({ axis: 'horizontal' }),
+      },
+      {
+        label: 'Distribute vertically',
+        message: Message.DistributedNodes({ axis: 'vertical' }),
+      },
+    )
+  }
+  return h.div(
+    [
+      h.Class(
+        'context-menu fixed z-30 w-56 max-h-80 overflow-auto bg-neutral-900 border border-neutral-700 rounded shadow-xl flex flex-col',
+      ),
+      h.Style({ left: `${menu.clientX}px`, top: `${menu.clientY}px` }),
+    ],
+    [
+      h.div(
+        [
+          h.Class(
+            'px-2 py-1 text-[10px] uppercase tracking-wide text-neutral-500 border-b border-neutral-800',
+          ),
+        ],
+        [
+          `${node.id} · ${isNodeType(node.type) ? NODE_REGISTRY[node.type].label : node.type}`,
+        ],
+      ),
+      ...actions.map(action =>
+        h.button(
+          [
+            h.OnClick(action.message),
+            h.Class(
+              'context-menu-item px-2 py-1 text-left hover:bg-sky-800 text-neutral-200',
+            ),
+          ],
+          [action.label],
+        ),
+      ),
+      h.button(
+        [
+          h.OnClick(Message.DismissedNodeMenu()),
+          h.Class(
+            'context-menu-item px-2 py-1 text-left hover:bg-neutral-800 text-neutral-400 border-t border-neutral-800',
+          ),
+        ],
+        ['Dismiss'],
+      ),
+    ],
+  )
+}
+
+function rerouteNodeView(
+  model: Model,
+  h: HtmlBuilder<Message>,
+  node: EditorNode,
+  status: NodeStatus,
+  highlighted: boolean,
+): ReturnType<HtmlBuilder<Message>['g']> {
+  const selected = model.selectedNodeIds.includes(node.id)
+  const size = REROUTE_SIZE
+  const isDeclaration = node.type === 'NamedRerouteDeclaration'
+  const isUsage = node.type === 'NamedRerouteUsage'
+  const declarationId = isDeclaration
+    ? node.id
+    : isUsage
+      ? declarationOfUsage(model, node.id)
+      : null
+  const name = declarationId === null ? '' : rerouteName(model, declarationId)
+  const fill = isDeclaration ? '#6d28d9' : isUsage ? '#1d4ed8' : '#161b22'
+  const stroke = selected ? '#58a6ff' : STATUS_COLORS[status]
+  return h.g(
+    [h.Transform(`translate(${node.position.x},${node.position.y})`)],
+    [
+      selected || highlighted
+        ? h.circle([
+            h.Cx(String(size / 2)),
+            h.Cy(String(size / 2)),
+            h.R(String(size / 2 + 3)),
+            h.Fill('none'),
+            h.Stroke(selected ? '#58a6ff' : HIGHLIGHT_COLOR),
+            h.StrokeWidth('2'),
+            ...(selected ? [] : [h.StrokeDasharray('6 4')]),
+          ])
+        : h.empty,
+      h.circle([
+        h.Cx(String(size / 2)),
+        h.Cy(String(size / 2)),
+        h.R(String(size / 2)),
+        h.Fill(fill),
+        h.Stroke(stroke),
+        h.StrokeWidth('1.5'),
+        h.Cursor('grab'),
+        h.OnClick(Message.SelectedNode({ nodeId: node.id })),
+        h.OnPointerDown(
+          (_pointerType, button, sx, sy, _timeStamp, clientX, clientY) => {
+            if (button === 0) {
+              return Option.some(
+                Message.StartedNodeDrag({ nodeId: node.id, x: sx, y: sy }),
+              )
+            }
+            if (button === 2) {
+              return Option.some(
+                Message.OpenedNodeMenu({ nodeId: node.id, clientX, clientY }),
+              )
+            }
+            return Option.none()
+          },
+        ),
+      ]),
+      h.circle([
+        h.Cx('0'),
+        h.Cy(String(size / 2)),
+        h.R('5'),
+        h.Fill(typeColor('float')),
+        h.Stroke('#0d1117'),
+        h.StrokeWidth('2'),
+        h.PointerEvents('none'),
+      ]),
+      h.circle([
+        h.Cx(String(size)),
+        h.Cy(String(size / 2)),
+        h.R('5'),
+        h.Fill(typeColor('float')),
+        h.Stroke('#0d1117'),
+        h.StrokeWidth('2'),
+        h.PointerEvents('none'),
+      ]),
+      name !== ''
+        ? h.text(
+            [
+              h.X(String(size / 2)),
+              h.Y('-6'),
+              h.Fill('#c9d1d9'),
+              h.FontSize('11'),
+              h.TextAnchor('middle'),
+              h.PointerEvents('none'),
+            ],
+            [name],
+          )
+        : h.empty,
+    ],
+  )
+}
+
 function nodeView(
   model: Model,
   h: HtmlBuilder<Message>,
@@ -1118,6 +1462,9 @@ function nodeView(
   status: NodeStatus,
   highlighted: boolean,
 ): ReturnType<HtmlBuilder<Message>['g']> {
+  if (isRerouteType(node.type)) {
+    return rerouteNodeView(model, h, node, status, highlighted)
+  }
   const selected = model.selectedNodeIds.includes(node.id)
   const height = nodeHeight(node.type)
   const label = isNodeType(node.type)
@@ -1259,6 +1606,12 @@ function inspectorView(
   if (selectedGroup !== undefined) {
     return groupInspector(h, selectedGroup)
   }
+  const selectedCollapsed = model.collapsed.find(
+    entry => entry.id === Option.getOrNull(model.selectedCollapsedId),
+  )
+  if (selectedCollapsed !== undefined) {
+    return collapsedInspector(h, selectedCollapsed)
+  }
   const selected = model.nodes.find(n => n.id === model.selectedNodeIds[0])
   return h.div(
     [h.Class('border-b border-neutral-800 p-3 max-h-64 overflow-auto')],
@@ -1269,7 +1622,198 @@ function inspectorView(
             [h.Class('text-neutral-500')],
             ['Select a node to edit its values.'],
           )
-        : inspectorFor(h, selected),
+        : isRerouteType(selected.type)
+          ? rerouteInspector(h, model, selected)
+          : inspectorFor(h, selected),
+    ],
+  )
+}
+
+const INSPECTOR_BUTTON =
+  'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-3 py-1'
+
+function rerouteInspector(
+  h: HtmlBuilder<Message>,
+  model: Model,
+  node: EditorNode,
+): ReturnType<HtmlBuilder<Message>['div']> {
+  if (node.type === 'NamedRerouteDeclaration') {
+    return h.div(
+      [h.Class('flex flex-col gap-2')],
+      [
+        h.div(
+          [h.Class('text-neutral-400')],
+          [`Reroute Declaration (${node.id})`],
+        ),
+        h.label(
+          [h.Class('flex items-center gap-2')],
+          [
+            h.span([h.Class('w-12 text-neutral-400')], ['Name']),
+            h.input([
+              h.Type('text'),
+              h.Value(rerouteName(model, node.id)),
+              h.OnInput(name =>
+                Message.RenamedReroute({ declarationId: node.id, name }),
+              ),
+              h.Class(
+                'w-full bg-neutral-800 border border-neutral-700 rounded px-2 py-1 text-neutral-100',
+              ),
+              h.AriaLabel('Reroute name'),
+            ]),
+          ],
+        ),
+        h.button(
+          [
+            h.OnClick(
+              Message.AddedNamedRerouteUsage({ declarationId: node.id }),
+            ),
+            h.Class(INSPECTOR_BUTTON),
+          ],
+          ['Add usage'],
+        ),
+        h.button(
+          [
+            h.OnClick(
+              Message.SelectedRerouteUsages({ declarationId: node.id }),
+            ),
+            h.Class(INSPECTOR_BUTTON),
+          ],
+          ['Select usages'],
+        ),
+        h.button(
+          [
+            h.OnClick(
+              Message.ConvertedNamedRerouteToReroute({ nodeId: node.id }),
+            ),
+            h.Class(INSPECTOR_BUTTON),
+          ],
+          ['Convert to reroute'],
+        ),
+        h.button(
+          [
+            h.OnClick(Message.RequestedDeleteSelection()),
+            h.Class('bg-red-900 hover:bg-red-800 text-white rounded px-3 py-1'),
+          ],
+          ['Delete node'],
+        ),
+      ],
+    )
+  }
+  if (node.type === 'NamedRerouteUsage') {
+    const declarationId = declarationOfUsage(model, node.id)
+    const name =
+      declarationId === null ? 'Reroute' : rerouteName(model, declarationId)
+    return h.div(
+      [h.Class('flex flex-col gap-2')],
+      [
+        h.div([h.Class('text-neutral-400')], [`Reroute Usage (${node.id})`]),
+        h.div(
+          [h.Class('text-neutral-500 text-xs')],
+          [`Declaration: ${declarationId ?? 'none'} · ${name}`],
+        ),
+        h.button(
+          [
+            h.OnClick(Message.SelectedRerouteDeclaration({ usageId: node.id })),
+            h.Class(INSPECTOR_BUTTON),
+          ],
+          ['Select declaration'],
+        ),
+        h.button(
+          [
+            h.OnClick(
+              Message.ConvertedNamedRerouteToReroute({ nodeId: node.id }),
+            ),
+            h.Class(INSPECTOR_BUTTON),
+          ],
+          ['Convert to reroute'],
+        ),
+        h.button(
+          [
+            h.OnClick(Message.RequestedDeleteSelection()),
+            h.Class('bg-red-900 hover:bg-red-800 text-white rounded px-3 py-1'),
+          ],
+          ['Delete node'],
+        ),
+      ],
+    )
+  }
+  return h.div(
+    [h.Class('flex flex-col gap-2')],
+    [
+      h.div([h.Class('text-neutral-400')], [`Reroute (${node.id})`]),
+      h.button(
+        [
+          h.OnClick(Message.ConvertedRerouteToNamed({ nodeId: node.id })),
+          h.Class(INSPECTOR_BUTTON),
+        ],
+        ['Convert to Named Reroute'],
+      ),
+      h.button(
+        [
+          h.OnClick(Message.RequestedDeleteSelection()),
+          h.Class('bg-red-900 hover:bg-red-800 text-white rounded px-3 py-1'),
+        ],
+        ['Delete node'],
+      ),
+    ],
+  )
+}
+
+function collapsedInspector(
+  h: HtmlBuilder<Message>,
+  entry: CollapsedNode,
+): ReturnType<HtmlBuilder<Message>['div']> {
+  return h.div(
+    [h.Class('border-b border-neutral-800 p-3 max-h-64 overflow-auto')],
+    [
+      h.div(
+        [h.Class('font-semibold text-neutral-100 mb-2')],
+        ['Collapsed Nodes'],
+      ),
+      h.div(
+        [h.Class('flex flex-col gap-3')],
+        [
+          h.label(
+            [h.Class('flex items-center gap-2')],
+            [
+              h.span([h.Class('w-12 text-neutral-400')], ['Name']),
+              h.input([
+                h.Type('text'),
+                h.Value(entry.name),
+                h.OnInput(name =>
+                  Message.RenamedCollapsed({ collapsedId: entry.id, name }),
+                ),
+                h.Class(
+                  'w-full bg-neutral-800 border border-neutral-700 rounded px-2 py-1 text-neutral-100',
+                ),
+                h.AriaLabel('Collapsed name'),
+              ]),
+            ],
+          ),
+          h.div(
+            [h.Class('text-neutral-500 text-xs')],
+            [
+              `${entry.nodeIds.length} hidden node${entry.nodeIds.length === 1 ? '' : 's'}`,
+            ],
+          ),
+          h.button(
+            [
+              h.OnClick(Message.ExpandedCollapsed({ collapsedId: entry.id })),
+              h.Class(INSPECTOR_BUTTON),
+            ],
+            ['Expand'],
+          ),
+          h.button(
+            [
+              h.OnClick(Message.RequestedDeleteSelection()),
+              h.Class(
+                'bg-red-900 hover:bg-red-800 text-white rounded px-3 py-1',
+              ),
+            ],
+            ['Delete container'],
+          ),
+        ],
+      ),
     ],
   )
 }

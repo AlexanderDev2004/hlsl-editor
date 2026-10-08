@@ -1,7 +1,11 @@
 // Shared canvas layout math. Imported by both view (rendering) and
 // update (fit-view calculations) so the two can never drift apart.
 
-import { NODE_REGISTRY, isNodeType } from '@hlsl-editor/shader-nodes'
+import {
+  NODE_REGISTRY,
+  isNodeType,
+  isRerouteType,
+} from '@hlsl-editor/shader-nodes'
 
 export const NODE_W = 200
 export const HEADER_H = 30
@@ -9,6 +13,13 @@ export const ROW_H = 24
 export const PAD = 8
 export const BASE_W = 1600
 export const BASE_H = 1000
+
+// Reroute nodes are small circular pass-throughs, not full cards.
+export const REROUTE_SIZE = 30
+
+export function nodeWidth(type: string): number {
+  return isRerouteType(type) ? REROUTE_SIZE : NODE_W
+}
 
 export const ZOOM_MIN = 0.25
 export const ZOOM_MAX = 3
@@ -25,6 +36,9 @@ export function clampZoom(zoom: number): number {
 }
 
 export function nodeHeight(type: string): number {
+  if (isRerouteType(type)) {
+    return REROUTE_SIZE
+  }
   if (!isNodeType(type)) {
     return 64
   }
@@ -33,6 +47,9 @@ export function nodeHeight(type: string): number {
   return HEADER_H + rows * ROW_H + PAD * 2
 }
 
-export function portY(_type: string, index: number): number {
+export function portY(type: string, index: number): number {
+  if (isRerouteType(type)) {
+    return REROUTE_SIZE / 2
+  }
   return HEADER_H + PAD + index * ROW_H + ROW_H / 2
 }

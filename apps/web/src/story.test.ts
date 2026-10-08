@@ -857,4 +857,385 @@ describe('editor update', () => {
       }),
     )
   })
+
+  test('InsertedRerouteOnEdge splits the wire through a reroute', () => {
+    story(
+      update,
+      given(seedModel()),
+      message(
+        Message.InsertedRerouteOnEdge({
+          edgeId: 'e1',
+          worldX: 200,
+          worldY: 150,
+        }),
+      ),
+      Command.expectNone(),
+      model((m: Model) => {
+        const reroute = m.nodes.find(n => n.type === 'Reroute')
+        expect(reroute).toBeDefined()
+        expect(reroute?.position.x).toBe(185)
+        expect(m.edges.some(e => e.id === 'e1')).toBe(false)
+        expect(
+          m.edges.some(
+            e => e.sourceNodeId === 'n1' && e.targetNodeId === reroute?.id,
+          ),
+        ).toBe(true)
+        expect(
+          m.edges.some(
+            e => e.sourceNodeId === reroute?.id && e.targetNodeId === 'n3',
+          ),
+        ).toBe(true)
+        expect(m.selectedNodeIds).toEqual([reroute?.id])
+      }),
+    )
+  })
+
+  test('ConvertedRerouteToNamed creates a declaration/usage pair', () => {
+    story(
+      update,
+      given({
+        ...seedModel(),
+        nodes: [
+          ...seedModel().nodes,
+          {
+            id: 'n5',
+            type: 'Reroute',
+            position: { x: 240, y: 150 },
+            params: {},
+          },
+        ],
+        edges: [
+          {
+            id: 'e1',
+            sourceNodeId: 'n1',
+            sourcePort: 'out',
+            targetNodeId: 'n5',
+            targetPort: 'in',
+          },
+          {
+            id: 'e2',
+            sourceNodeId: 'n5',
+            sourcePort: 'out',
+            targetNodeId: 'n3',
+            targetPort: 'a',
+          },
+          {
+            id: 'e3',
+            sourceNodeId: 'n2',
+            sourcePort: 'out',
+            targetNodeId: 'n3',
+            targetPort: 'b',
+          },
+          {
+            id: 'e4',
+            sourceNodeId: 'n3',
+            sourcePort: 'out',
+            targetNodeId: 'n4',
+            targetPort: 'color',
+          },
+        ],
+        nextNode: 6,
+        nextEdge: 5,
+      }),
+      message(Message.ConvertedRerouteToNamed({ nodeId: 'n5' })),
+      model((m: Model) => {
+        expect(m.nodes.some(n => n.id === 'n5')).toBe(false)
+        const declaration = m.nodes.find(
+          n => n.type === 'NamedRerouteDeclaration',
+        )
+        const usage = m.nodes.find(n => n.type === 'NamedRerouteUsage')
+        expect(declaration).toBeDefined()
+        expect(usage).toBeDefined()
+        expect(
+          m.edges.some(
+            e =>
+              e.sourceNodeId === declaration?.id &&
+              e.targetNodeId === usage?.id,
+          ),
+        ).toBe(true)
+        expect(
+          m.edges.some(
+            e => e.sourceNodeId === 'n1' && e.targetNodeId === declaration?.id,
+          ),
+        ).toBe(true)
+        expect(
+          m.edges.some(
+            e => e.sourceNodeId === usage?.id && e.targetNodeId === 'n3',
+          ),
+        ).toBe(true)
+        expect(m.rerouteNames[declaration?.id ?? '']).toBe('Reroute 1')
+      }),
+    )
+  })
+
+  test('AddedNamedRerouteUsage links a usage and selection follows it', () => {
+    story(
+      update,
+      given({
+        ...seedModel(),
+        nodes: [
+          ...seedModel().nodes,
+          {
+            id: 'n5',
+            type: 'NamedRerouteDeclaration',
+            position: { x: 240, y: 150 },
+            params: {},
+          },
+        ],
+        nextNode: 6,
+      }),
+      message(Message.AddedNamedRerouteUsage({ declarationId: 'n5' })),
+      model((m: Model) => {
+        const usage = m.nodes.find(n => n.type === 'NamedRerouteUsage')
+        expect(usage).toBeDefined()
+        expect(
+          m.edges.some(
+            e => e.sourceNodeId === 'n5' && e.targetNodeId === usage?.id,
+          ),
+        ).toBe(true)
+      }),
+      message(Message.SelectedRerouteUsages({ declarationId: 'n5' })),
+      model((m: Model) => {
+        expect(m.selectedNodeIds).toHaveLength(1)
+        expect(m.nodes.find(n => n.id === m.selectedNodeIds[0])?.type).toBe(
+          'NamedRerouteUsage',
+        )
+      }),
+    )
+  })
+
+  test('SelectedRerouteDeclaration jumps from a usage to its declaration', () => {
+    story(
+      update,
+      given({
+        ...seedModel(),
+        nodes: [
+          ...seedModel().nodes,
+          {
+            id: 'n5',
+            type: 'NamedRerouteDeclaration',
+            position: { x: 240, y: 150 },
+            params: {},
+          },
+          {
+            id: 'n6',
+            type: 'NamedRerouteUsage',
+            position: { x: 240, y: 230 },
+            params: {},
+          },
+        ],
+        edges: [
+          ...seedModel().edges,
+          {
+            id: 'e4',
+            sourceNodeId: 'n5',
+            sourcePort: 'out',
+            targetNodeId: 'n6',
+            targetPort: 'in',
+          },
+        ],
+        nextNode: 7,
+        nextEdge: 5,
+      }),
+      message(Message.SelectedRerouteDeclaration({ usageId: 'n6' })),
+      model((m: Model) => {
+        expect(m.selectedNodeIds).toEqual(['n5'])
+      }),
+    )
+  })
+
+  test('ConvertedNamedRerouteToReroute merges back to a plain reroute', () => {
+    story(
+      update,
+      given({
+        ...seedModel(),
+        nodes: [
+          ...seedModel().nodes,
+          {
+            id: 'n5',
+            type: 'NamedRerouteDeclaration',
+            position: { x: 240, y: 150 },
+            params: {},
+          },
+          {
+            id: 'n6',
+            type: 'NamedRerouteUsage',
+            position: { x: 300, y: 150 },
+            params: {},
+          },
+        ],
+        edges: [
+          {
+            id: 'e1',
+            sourceNodeId: 'n1',
+            sourcePort: 'out',
+            targetNodeId: 'n5',
+            targetPort: 'in',
+          },
+          {
+            id: 'e2',
+            sourceNodeId: 'n5',
+            sourcePort: 'out',
+            targetNodeId: 'n6',
+            targetPort: 'in',
+          },
+          {
+            id: 'e3',
+            sourceNodeId: 'n6',
+            sourcePort: 'out',
+            targetNodeId: 'n3',
+            targetPort: 'a',
+          },
+          {
+            id: 'e4',
+            sourceNodeId: 'n2',
+            sourcePort: 'out',
+            targetNodeId: 'n3',
+            targetPort: 'b',
+          },
+          {
+            id: 'e5',
+            sourceNodeId: 'n3',
+            sourcePort: 'out',
+            targetNodeId: 'n4',
+            targetPort: 'color',
+          },
+        ],
+        nextNode: 7,
+        nextEdge: 6,
+      }),
+      message(Message.ConvertedNamedRerouteToReroute({ nodeId: 'n5' })),
+      model((m: Model) => {
+        const reroute = m.nodes.find(n => n.type === 'Reroute')
+        expect(reroute).toBeDefined()
+        expect(m.nodes.some(n => n.type === 'NamedRerouteDeclaration')).toBe(
+          false,
+        )
+        expect(
+          m.edges.some(
+            e => e.sourceNodeId === 'n1' && e.targetNodeId === reroute?.id,
+          ),
+        ).toBe(true)
+        expect(
+          m.edges.some(
+            e => e.sourceNodeId === reroute?.id && e.targetNodeId === 'n3',
+          ),
+        ).toBe(true)
+      }),
+    )
+  })
+
+  test('RenamedReroute stores the display name', () => {
+    story(
+      update,
+      given({
+        ...seedModel(),
+        nodes: [
+          ...seedModel().nodes,
+          {
+            id: 'n5',
+            type: 'NamedRerouteDeclaration',
+            position: { x: 0, y: 0 },
+            params: {},
+          },
+        ],
+        nextNode: 6,
+      }),
+      message(Message.RenamedReroute({ declarationId: 'n5', name: 'Base UV' })),
+      model((m: Model) => {
+        expect(m.rerouteNames['n5']).toBe('Base UV')
+      }),
+    )
+  })
+
+  test('AlignedNodes lines up selected nodes on an edge', () => {
+    story(
+      update,
+      given({ ...seedModel(), selectedNodeIds: ['n1', 'n2'] }),
+      message(Message.AlignedNodes({ mode: 'top' })),
+      model((m: Model) => {
+        const n1 = m.nodes.find(n => n.id === 'n1')
+        const n2 = m.nodes.find(n => n.id === 'n2')
+        expect(n1?.position.y).toBe(n2?.position.y)
+      }),
+    )
+  })
+
+  test('DistributedNodes spaces three nodes evenly', () => {
+    story(
+      update,
+      given({ ...seedModel(), selectedNodeIds: ['n1', 'n2', 'n3'] }),
+      message(Message.DistributedNodes({ axis: 'horizontal' })),
+      model((m: Model) => {
+        const n1 = m.nodes.find(n => n.id === 'n1')?.position.x ?? 0
+        const n2 = m.nodes.find(n => n.id === 'n2')?.position.x ?? 0
+        const n3 = m.nodes.find(n => n.id === 'n3')?.position.x ?? 0
+        expect(n2 - n1).toBeCloseTo(n3 - n2)
+      }),
+    )
+  })
+
+  test('CollapsedSelection hides members and Expand restores them', () => {
+    story(
+      update,
+      given({ ...seedModel(), selectedNodeIds: ['n1', 'n2'] }),
+      message(Message.CollapsedSelection()),
+      model((m: Model) => {
+        expect(m.collapsed).toHaveLength(1)
+        expect(m.collapsed[0]?.nodeIds).toEqual(['n1', 'n2'])
+        expect(Option.getOrNull(m.selectedCollapsedId)).toBe('c1')
+      }),
+      message(Message.ExpandedCollapsed({ collapsedId: 'c1' })),
+      model((m: Model) => {
+        expect(m.collapsed).toHaveLength(0)
+      }),
+    )
+  })
+
+  test('CompletedLoadGraph restores reroute names and collapsed groups', () => {
+    const json = JSON.stringify({
+      version: 1,
+      nodes: [
+        {
+          id: 'n1',
+          type: 'Float',
+          position: { x: 0, y: 0 },
+          params: { value: 1 },
+        },
+        {
+          id: 'n4',
+          type: 'FragmentOutput',
+          position: { x: 400, y: 0 },
+          params: {},
+        },
+        {
+          id: 'n5',
+          type: 'NamedRerouteDeclaration',
+          position: { x: 200, y: 0 },
+          params: {},
+        },
+      ],
+      edges: [
+        {
+          id: 'e1',
+          source: { nodeId: 'n5', port: 'out' },
+          target: { nodeId: 'n4', port: 'color' },
+        },
+      ],
+      outputNodeId: 'n4',
+      rerouteNames: { n5: 'Base UV' },
+      collapsed: [{ id: 'c1', name: 'Inputs', nodeIds: ['n1'] }],
+    })
+    story(
+      update,
+      given(emptyModel()),
+      message(Message.CompletedLoadGraph({ json })),
+      model((m: Model) => {
+        expect(m.rerouteNames['n5']).toBe('Base UV')
+        expect(m.collapsed).toHaveLength(1)
+        expect(m.collapsed[0]?.name).toBe('Inputs')
+        expect(m.nextCollapsed).toBe(2)
+      }),
+    )
+  })
 })

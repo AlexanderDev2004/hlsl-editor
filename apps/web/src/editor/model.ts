@@ -46,10 +46,23 @@ export const Group = Schema.Struct({
 })
 export type Group = typeof Group.Type
 
+// A collapsed selection (Unreal-style Collapse Nodes). The member nodes stay
+// in the graph — validation and codegen are unchanged — but the view hides
+// them behind a single container node. `nodeIds` are the hidden members.
+export const CollapsedNode = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  nodeIds: Schema.Array(Schema.String),
+})
+export type CollapsedNode = typeof CollapsedNode.Type
+
 export const Snapshot = Schema.Struct({
   nodes: Schema.Array(EditorNode),
   edges: Schema.Array(EditorEdge),
   groups: Schema.Array(Group),
+  collapsed: Schema.Array(CollapsedNode),
+  nextCollapsed: Schema.Number,
+  rerouteNames: Schema.Record(Schema.String, Schema.String),
   outputNodeId: Schema.Option(Schema.String),
   nextNode: Schema.Number,
   nextEdge: Schema.Number,
@@ -75,6 +88,14 @@ export const ContextMenu = Schema.Struct({
   search: Schema.String,
 })
 export type ContextMenu = typeof ContextMenu.Type
+
+// The right-click menu for a specific node (reroute actions, align/distribute).
+export const NodeMenu = Schema.Struct({
+  nodeId: Schema.String,
+  clientX: Schema.Number,
+  clientY: Schema.Number,
+})
+export type NodeMenu = typeof NodeMenu.Type
 
 export const DragState = Schema.Union([
   Schema.Struct({ mode: Schema.Literal('idle') }),
@@ -137,6 +158,10 @@ export const Model = Schema.Struct({
   groups: Schema.Array(Group),
   selectedGroupId: Schema.Option(Schema.String),
   nextGroup: Schema.Number,
+  collapsed: Schema.Array(CollapsedNode),
+  selectedCollapsedId: Schema.Option(Schema.String),
+  nextCollapsed: Schema.Number,
+  rerouteNames: Schema.Record(Schema.String, Schema.String),
   viewport: Schema.Struct({
     x: Schema.Number,
     y: Schema.Number,
@@ -155,6 +180,7 @@ export const Model = Schema.Struct({
   pasteOffset: Schema.Number,
   minimapVisible: Schema.Boolean,
   contextMenu: Schema.Option(ContextMenu),
+  nodeMenu: Schema.Option(NodeMenu),
   simulateLoading: Schema.Boolean,
   loadingVariant: Schema.Union([
     Schema.Literal('border'),
@@ -225,6 +251,10 @@ export function seedModel(): Model {
     groups: [],
     selectedGroupId: Option.none(),
     nextGroup: 1,
+    collapsed: [],
+    selectedCollapsedId: Option.none(),
+    nextCollapsed: 1,
+    rerouteNames: {},
     viewport: { x: 0, y: 0, zoom: 1 },
     drag: { mode: 'idle' },
     pending: { active: false, fromNodeId: '', fromPort: '' },
@@ -239,6 +269,7 @@ export function seedModel(): Model {
     pasteOffset: 1,
     minimapVisible: true,
     contextMenu: Option.none(),
+    nodeMenu: Option.none(),
     simulateLoading: false,
     loadingVariant: 'border',
     settingsOpen: false,
@@ -265,6 +296,9 @@ export function takeSnapshot(model: Model): Snapshot {
     nodes: model.nodes,
     edges: model.edges,
     groups: model.groups,
+    collapsed: model.collapsed,
+    nextCollapsed: model.nextCollapsed,
+    rerouteNames: model.rerouteNames,
     outputNodeId: model.outputNodeId,
     nextNode: model.nextNode,
     nextEdge: model.nextEdge,
@@ -283,6 +317,9 @@ export function restoreSnapshot(model: Model, snap: Snapshot): Model {
     nodes: () => snap.nodes,
     edges: () => snap.edges,
     groups: () => snap.groups,
+    collapsed: () => snap.collapsed,
+    nextCollapsed: () => snap.nextCollapsed,
+    rerouteNames: () => snap.rerouteNames,
     outputNodeId: () => snap.outputNodeId,
     nextNode: () => snap.nextNode,
     nextEdge: () => snap.nextEdge,
@@ -291,6 +328,7 @@ export function restoreSnapshot(model: Model, snap: Snapshot): Model {
     selectedEdgeId: () => Option.none(),
     hoveredEdgeId: () => Option.none(),
     selectedGroupId: () => Option.none(),
+    selectedCollapsedId: () => Option.none(),
     pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
     suppressClick: () => false,
   })
@@ -349,7 +387,23 @@ export function fromSerialized(data: {
     target: { nodeId: string; port: string }
   }>
   outputNodeId: string | null
-}): Pick<Model, 'nodes' | 'edges' | 'outputNodeId' | 'nextNode' | 'nextEdge'> {
+  rerouteNames?: Record<string, string>
+  collapsed?: Array<{
+    id: string
+    name: string
+    nodeIds: ReadonlyArray<string>
+  }>
+}): Pick<
+  Model,
+  | 'nodes'
+  | 'edges'
+  | 'outputNodeId'
+  | 'nextNode'
+  | 'nextEdge'
+  | 'rerouteNames'
+  | 'collapsed'
+  | 'nextCollapsed'
+> {
   const nodes: Array<EditorNode> = data.nodes
     .filter(n => isNodeType(n.type))
     .map(n => ({
@@ -385,6 +439,17 @@ export function fromSerialized(data: {
       }
     }
   }
+  const collapsed = data.collapsed ?? []
+  let maxCollapsed = 0
+  for (const c of collapsed) {
+    const m = /^c(\d+)$/.exec(c.id)
+    if (m !== null && m[1] !== undefined) {
+      const v = Number.parseInt(m[1], 10)
+      if (Number.isFinite(v) && v > maxCollapsed) {
+        maxCollapsed = v
+      }
+    }
+  }
   return {
     nodes,
     edges,
@@ -394,5 +459,8 @@ export function fromSerialized(data: {
         : Option.some(data.outputNodeId),
     nextNode: maxNode + 1,
     nextEdge: maxEdge + 1,
+    rerouteNames: data.rerouteNames ?? {},
+    collapsed: collapsed.map(c => ({ ...c, nodeIds: [...c.nodeIds] })),
+    nextCollapsed: maxCollapsed + 1,
   }
 }

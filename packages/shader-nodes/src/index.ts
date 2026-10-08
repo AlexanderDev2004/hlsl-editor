@@ -16,6 +16,9 @@ export const NODE_TYPES = [
   "Divide",
   "Split",
   "Combine",
+  "Reroute",
+  "NamedRerouteDeclaration",
+  "NamedRerouteUsage",
   "FragmentOutput",
 ] as const;
 export type NodeType = (typeof NODE_TYPES)[number];
@@ -31,7 +34,7 @@ export interface PortDef {
 export interface NodeDefinition {
   type: NodeType;
   label: string;
-  category: "Input" | "Math" | "Vector" | "Output";
+  category: "Input" | "Math" | "Vector" | "Utility" | "Output";
   inputs: Array<PortDef>;
   outputs: Array<PortDef>;
   defaultParams: Record<string, number | Array<number>>;
@@ -62,6 +65,21 @@ const MATH_INPUTS: Array<PortDef> = [
     required: true,
     accepts: ["float", "float2", "float3", "float4"],
   },
+];
+
+// Reroute-family nodes pass their input value through unchanged. The port
+// type is nominal (float); the real type is resolved from the upstream.
+const ANY_INPUT: Array<PortDef> = [
+  {
+    name: "in",
+    direction: "in",
+    valueType: "float",
+    required: true,
+    accepts: ["float", "float2", "float3", "float4"],
+  },
+];
+const PASSTHROUGH_OUTPUT: Array<PortDef> = [
+  { name: "out", direction: "out", valueType: "float", required: false },
 ];
 
 export const NODE_REGISTRY: Record<NodeType, NodeDefinition> = {
@@ -179,7 +197,41 @@ export const NODE_REGISTRY: Record<NodeType, NodeDefinition> = {
     outputs: [],
     defaultParams: {},
   },
+  Reroute: {
+    type: "Reroute",
+    label: "Reroute",
+    category: "Utility",
+    inputs: ANY_INPUT,
+    outputs: PASSTHROUGH_OUTPUT,
+    defaultParams: {},
+  },
+  NamedRerouteDeclaration: {
+    type: "NamedRerouteDeclaration",
+    label: "Reroute Declaration",
+    category: "Utility",
+    inputs: ANY_INPUT,
+    outputs: PASSTHROUGH_OUTPUT,
+    defaultParams: {},
+  },
+  NamedRerouteUsage: {
+    type: "NamedRerouteUsage",
+    label: "Reroute Usage",
+    category: "Utility",
+    inputs: ANY_INPUT,
+    outputs: PASSTHROUGH_OUTPUT,
+    defaultParams: {},
+  },
 };
+
+export const REROUTE_TYPES: ReadonlyArray<NodeType> = [
+  "Reroute",
+  "NamedRerouteDeclaration",
+  "NamedRerouteUsage",
+];
+
+export function isRerouteType(type: string): boolean {
+  return REROUTE_TYPES.some((t) => t === type);
+}
 
 export function isNodeType(value: string): value is NodeType {
   return (NODE_TYPES as ReadonlyArray<string>).includes(value);
@@ -237,6 +289,10 @@ export function resolveOutputType(
       }
       return "float2";
     }
+    case "Reroute":
+    case "NamedRerouteDeclaration":
+    case "NamedRerouteUsage":
+      return inputTypes["in"] ?? null;
     case "FragmentOutput":
       return null;
   }
