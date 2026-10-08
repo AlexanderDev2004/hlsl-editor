@@ -179,4 +179,19 @@ describe('editor view', () => {
       expect(text('Graph is invalid. Fix the problems below.')).toExist(),
     )
   })
+
+  test('settings show commands, record state, and macOS display mode', () => {
+    scene(
+      { update, view },
+      given({ ...seedModel(), shortcutPlatform: 'macos' }),
+      click(role('button', { name: 'Settings' })),
+      expect(text('Shortcut display')).toExist(),
+      expect(text('⌘C')).toExist(),
+      click(role('button', { name: 'Record shortcut for Copy selection' })),
+      expect(text('Press keys…')).toExist(),
+      click(role('button', { name: 'Cancel recording for Copy selection' })),
+      click(role('button', { name: 'Close settings' })),
+      expect(text('Shortcut display')).toBeAbsent(),
+    )
+  })
 })

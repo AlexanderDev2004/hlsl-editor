@@ -7,6 +7,8 @@ import { modifyFields } from 'foldkit/struct'
 import type { Graph } from '@hlsl-editor/graph'
 import { createNodeOfType, isNodeType } from '@hlsl-editor/shader-nodes'
 
+import { DEFAULT_KEYMAP } from './shortcuts'
+
 // EDITOR GRAPH (Schema mirror of the domain graph; ports are derived from
 // the node registry so they are not stored)
 
@@ -158,10 +160,18 @@ export const Model = Schema.Struct({
     Schema.Literal('border'),
     Schema.Literal('overlay'),
   ]),
+  settingsOpen: Schema.Boolean,
+  recordingAction: Schema.Option(Schema.String),
+  shortcutPlatform: Schema.Union([
+    Schema.Literal('windows'),
+    Schema.Literal('macos'),
+  ]),
+  keymap: Schema.Record(Schema.String, Schema.String),
 })
 export type Model = typeof Model.Type
 
 export const STORAGE_KEY = 'hlsl-editor:graph:v1'
+export const SETTINGS_KEY = 'hlsl-editor:settings:v1'
 
 // SEED (demo graph: Float(2) * Float(5) -> Fragment Output)
 
@@ -231,6 +241,10 @@ export function seedModel(): Model {
     contextMenu: Option.none(),
     simulateLoading: false,
     loadingVariant: 'border',
+    settingsOpen: false,
+    recordingAction: Option.none(),
+    shortcutPlatform: 'windows',
+    keymap: { ...DEFAULT_KEYMAP },
   }
 }
 

@@ -6,7 +6,7 @@ import { Command } from 'foldkit'
 import { readAsText, select } from 'foldkit/file'
 
 import { Message } from './message'
-import { STORAGE_KEY } from './model'
+import { SETTINGS_KEY, STORAGE_KEY } from './model'
 
 function storage(): Storage | null {
   try {
@@ -60,6 +60,51 @@ export const LoadGraph = Command.define('LoadGraph', {
       Effect.succeed(Message.FailedLoadGraph({ reason: String(error) })),
     ),
   ),
+})
+
+export const LoadSettings = Command.define('LoadSettings', {
+  messages: [
+    Message.CompletedLoadSettings,
+    Message.CompletedLoadSettingsEmpty,
+    Message.FailedLoadSettings,
+  ],
+  execute: Effect.sync(() => {
+    const store = storage()
+    if (store === null) {
+      return Message.CompletedLoadSettingsEmpty()
+    }
+    const json = store.getItem(SETTINGS_KEY)
+    if (json === null || json === '') {
+      return Message.CompletedLoadSettingsEmpty()
+    }
+    return Message.CompletedLoadSettings({ json })
+  }).pipe(
+    Effect.catch(error =>
+      Effect.succeed(Message.FailedLoadSettings({ reason: String(error) })),
+    ),
+  ),
+})
+
+export const PersistSettings = Command.define('PersistSettings', {
+  args: { json: Schema.String },
+  messages: [Message.CompletedPersistSettings, Message.FailedPersistSettings],
+  execute: ({ json }) =>
+    Effect.sync(() => {
+      const store = storage()
+      if (store === null) {
+        return Message.FailedPersistSettings({
+          reason: 'Browser storage is unavailable.',
+        })
+      }
+      store.setItem(SETTINGS_KEY, json)
+      return Message.CompletedPersistSettings()
+    }).pipe(
+      Effect.catch(error =>
+        Effect.succeed(
+          Message.FailedPersistSettings({ reason: String(error) }),
+        ),
+      ),
+    ),
 })
 
 export const DownloadJson = Command.define('DownloadJson', {

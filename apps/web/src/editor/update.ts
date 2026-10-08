@@ -13,7 +13,9 @@ import {
   CopyHlsl,
   DownloadJson,
   LoadGraph,
+  LoadSettings,
   PersistGraph,
+  PersistSettings,
   PickImportFile,
 } from './commands'
 import { DEFAULT_GROUP_COLOR, GROUP_COLORS } from './groups'
@@ -35,6 +37,16 @@ import {
 } from './model'
 import { isLoadingVariant } from './node-status'
 import { defaultOnSelectNodeFit } from './search'
+import {
+  DEFAULT_KEYMAP,
+  bindingFromKeyEvent,
+  bindingOwner,
+  commandById,
+  formatShortcut,
+  isShortcutPlatform,
+  parseShortcutSettings,
+  serializeShortcutSettings,
+} from './shortcuts'
 
 type UpdateReturn = Update.Return<Model, Message>
 
@@ -275,6 +287,16 @@ function deleteSelection(model: Model): Model {
 
 function closeContextMenu(model: Model): Model {
   return modifyFields(model, { contextMenu: () => Option.none() })
+}
+
+// Cancels an in-flight wire and closes the add-node menu. Escape routes here
+// when no overlay owns the key.
+function cancelPending(model: Model): Model {
+  return modifyFields(model, {
+    pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
+    contextMenu: () => Option.none(),
+    status: () => 'Connection cancelled.',
+  })
 }
 
 // Wraps the selected nodes in a named, colored group. Membership only — the
@@ -852,12 +874,182 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         }),
       }
     },
-    CancelledPending: () => ({
+    CancelledPending: () => ({ model: cancelPending(model) }),
+    PressedEscape: () =>
+      model.settingsOpen
+        ? {
+            model: modifyFields(model, {
+              settingsOpen: () => false,
+              recordingAction: () => Option.none(),
+            }),
+          }
+        : { model: cancelPending(model) },
+    PressedSettings: () => ({
       model: modifyFields(model, {
-        pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
+        settingsOpen: () => !model.settingsOpen,
+        recordingAction: () => Option.none(),
         contextMenu: () => Option.none(),
-        status: () => 'Connection cancelled.',
       }),
+    }),
+    OpenedSettings: () => ({
+      model: modifyFields(model, {
+        settingsOpen: () => true,
+        recordingAction: () => Option.none(),
+        contextMenu: () => Option.none(),
+      }),
+    }),
+    ClosedSettings: () => ({
+      model: modifyFields(model, {
+        settingsOpen: () => false,
+        recordingAction: () => Option.none(),
+      }),
+    }),
+    StartedShortcutRecording: ({ actionId }) => {
+      const command = commandById(actionId)
+      if (command === undefined) {
+        return { model }
+      }
+      return {
+        model: modifyFields(model, {
+          settingsOpen: () => true,
+          recordingAction: () => Option.some(actionId),
+          status: () =>
+            `Recording shortcut for "${command.label}" — press keys (Esc cancels).`,
+        }),
+      }
+    },
+    CancelledShortcutRecording: () => ({
+      model: modifyFields(model, {
+        recordingAction: () => Option.none(),
+        status: () => 'Shortcut recording cancelled.',
+      }),
+    }),
+    CapturedShortcut: ({
+      key,
+      ctrlKey,
+      metaKey,
+      altKey,
+      shiftKey,
+      isApple,
+    }) => {
+      const actionId = Option.getOrNull(model.recordingAction)
+      if (actionId === null) {
+        return { model }
+      }
+      const binding = Option.getOrNull(
+        bindingFromKeyEvent(
+          { key, ctrlKey, metaKey, altKey, shiftKey },
+          isApple,
+        ),
+      )
+      if (binding === null) {
+        return { model }
+      }
+      const owner = bindingOwner(model.keymap, binding, actionId)
+      if (owner !== null) {
+        const ownerLabel = commandById(owner)?.label ?? owner
+        return {
+          model: withStatus(
+            model,
+            `Shortcut ${formatShortcut(binding, model.shortcutPlatform)} is already used by "${ownerLabel}".`,
+          ),
+        }
+      }
+      const keymap = { ...model.keymap, [actionId]: binding }
+      const label = commandById(actionId)?.label ?? actionId
+      return {
+        model: modifyFields(model, {
+          keymap: () => keymap,
+          recordingAction: () => Option.none(),
+          status: () =>
+            `Shortcut for "${label}" set to ${formatShortcut(binding, model.shortcutPlatform)}.`,
+        }),
+        commands: [
+          PersistSettings({
+            json: serializeShortcutSettings({
+              platform: model.shortcutPlatform,
+              keymap,
+            }),
+          }),
+        ],
+      }
+    },
+    ResetShortcut: ({ actionId }) => {
+      const command = commandById(actionId)
+      if (command === undefined) {
+        return { model }
+      }
+      const keymap = { ...model.keymap, [actionId]: command.defaultBinding }
+      return {
+        model: modifyFields(model, {
+          keymap: () => keymap,
+          recordingAction: () => Option.none(),
+          status: () =>
+            `Reset "${command.label}" to ${formatShortcut(command.defaultBinding, model.shortcutPlatform)}.`,
+        }),
+        commands: [
+          PersistSettings({
+            json: serializeShortcutSettings({
+              platform: model.shortcutPlatform,
+              keymap,
+            }),
+          }),
+        ],
+      }
+    },
+    ResetAllShortcuts: () => {
+      const keymap = { ...DEFAULT_KEYMAP }
+      return {
+        model: modifyFields(model, {
+          keymap: () => keymap,
+          recordingAction: () => Option.none(),
+          status: () => 'All shortcuts reset to defaults.',
+        }),
+        commands: [
+          PersistSettings({
+            json: serializeShortcutSettings({
+              platform: model.shortcutPlatform,
+              keymap,
+            }),
+          }),
+        ],
+      }
+    },
+    ChangedShortcutPlatform: ({ platform }) => {
+      if (!isShortcutPlatform(platform)) {
+        return { model }
+      }
+      return {
+        model: modifyFields(model, { shortcutPlatform: () => platform }),
+        commands: [
+          PersistSettings({
+            json: serializeShortcutSettings({
+              platform,
+              keymap: model.keymap,
+            }),
+          }),
+        ],
+      }
+    },
+    CompletedLoadSettings: ({ json }) => {
+      const settings = parseShortcutSettings(safeParse(json))
+      if (settings === null) {
+        return { model }
+      }
+      return {
+        model: modifyFields(model, {
+          shortcutPlatform: () => settings.platform,
+          keymap: () => settings.keymap,
+        }),
+      }
+    },
+    CompletedLoadSettingsEmpty: () => ({ model }),
+    FailedLoadSettings: ({ reason }) => ({
+      model: withStatus(model, `Could not read saved settings (${reason}).`),
+    }),
+    CompletedPersistSettings: () => ({ model }),
+    FailedPersistSettings: ({ reason }) => ({
+      model: withStatus(model, `Could not save settings: ${reason}.`),
     }),
     OpenedContextMenu: ({ worldX, worldY, clientX, clientY }) => ({
       model: modifyFields(model, {
@@ -1160,10 +1352,18 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         }),
       }
     },
-    CompletedLoadEmpty: () => ({ model: seedModel() }),
+    CompletedLoadEmpty: () => ({
+      model: modifyFields(seedModel(), {
+        shortcutPlatform: () => model.shortcutPlatform,
+        keymap: () => model.keymap,
+      }),
+    }),
     FailedLoadGraph: ({ reason }) => ({
       model: withStatus(
-        seedModel(),
+        modifyFields(seedModel(), {
+          shortcutPlatform: () => model.shortcutPlatform,
+          keymap: () => model.keymap,
+        }),
         `Could not read saved graph (${reason}). Showing demo graph.`,
       ),
     }),
@@ -1238,5 +1438,5 @@ export const update = (model: Model, message: Message): UpdateReturn =>
 
 export const init: () => UpdateReturn = () => ({
   model: emptyModel(),
-  commands: [LoadGraph()],
+  commands: [LoadGraph(), LoadSettings()],
 })

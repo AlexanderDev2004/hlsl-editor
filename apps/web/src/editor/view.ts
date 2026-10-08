@@ -39,6 +39,15 @@ import {
   deriveNodeStatuses,
 } from './node-status'
 import { defaultOnSearch, nodeLabel } from './search'
+import {
+  SHORTCUT_CATEGORIES,
+  SHORTCUT_COMMANDS,
+  SHORTCUT_PLATFORMS,
+  type ShortcutCommand,
+  bindingFor,
+  bindingsEqual,
+  formatShortcut,
+} from './shortcuts'
 
 function portPosition(
   node: EditorNode,
@@ -261,6 +270,7 @@ export const view = (model: Model, h: HtmlBuilder<Message>): Document => {
           ],
         ),
         statusView(model, h),
+        settingsView(model, h),
       ],
     ),
   }
@@ -377,10 +387,196 @@ function headerView(
         ],
         ['Ungroup'],
       ),
+      h.button(
+        [
+          h.OnClick(Message.OpenedSettings()),
+          h.Class(
+            'ml-auto bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-3 py-1',
+          ),
+          h.AriaLabel('Settings'),
+        ],
+        ['Settings'],
+      ),
       h.span(
-        [h.Class('ml-auto text-neutral-500')],
+        [h.Class('text-neutral-500')],
         [`${model.nodes.length} nodes · ${model.edges.length} edges`],
       ),
+    ],
+  )
+}
+
+function settingsView(model: Model, h: HtmlBuilder<Message>): Html {
+  if (!model.settingsOpen) {
+    return h.empty
+  }
+  return h.div(
+    [h.Class('fixed inset-0 z-40 flex items-center justify-center')],
+    [
+      h.div([
+        h.Class('absolute inset-0 bg-black/60'),
+        h.OnClick(Message.ClosedSettings()),
+      ]),
+      h.div(
+        [
+          h.Class(
+            'relative w-[640px] max-h-[80vh] flex flex-col bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl',
+          ),
+        ],
+        [
+          h.div(
+            [
+              h.Class(
+                'flex items-center px-3 py-2 border-b border-neutral-800',
+              ),
+            ],
+            [
+              h.span([h.Class('font-semibold text-neutral-100')], ['Settings']),
+              h.button(
+                [
+                  h.OnClick(Message.ClosedSettings()),
+                  h.Class(
+                    'ml-auto text-neutral-400 hover:text-neutral-100 px-2 leading-none',
+                  ),
+                  h.AriaLabel('Close settings'),
+                ],
+                ['×'],
+              ),
+            ],
+          ),
+          shortcutPlatformToggle(model, h),
+          h.div(
+            [h.Class('flex-1 overflow-auto min-h-0')],
+            SHORTCUT_CATEGORIES.flatMap(category => [
+              h.div(
+                [
+                  h.Class(
+                    'px-3 pt-3 pb-1 text-[10px] uppercase tracking-wide text-neutral-500',
+                  ),
+                ],
+                [category],
+              ),
+              ...SHORTCUT_COMMANDS.filter(
+                command => command.category === category,
+              ).map(command => shortcutRow(model, h, command)),
+            ]),
+          ),
+          h.div(
+            [
+              h.Class(
+                'flex items-center gap-3 px-3 py-2 border-t border-neutral-800',
+              ),
+            ],
+            [
+              h.span(
+                [h.Class('text-xs text-neutral-500')],
+                ['Click Record, then press the keys you want. Esc cancels.'],
+              ),
+              h.button(
+                [
+                  h.OnClick(Message.ResetAllShortcuts()),
+                  h.Class(
+                    'ml-auto bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-3 py-1',
+                  ),
+                  h.AriaLabel('Reset all shortcuts'),
+                ],
+                ['Reset all'],
+              ),
+            ],
+          ),
+        ],
+      ),
+    ],
+  )
+}
+
+function shortcutPlatformToggle(model: Model, h: HtmlBuilder<Message>): Html {
+  return h.div(
+    [h.Class('flex items-center gap-2 px-3 py-2 border-b border-neutral-800')],
+    [
+      h.span([h.Class('text-neutral-400')], ['Shortcut display']),
+      ...SHORTCUT_PLATFORMS.map(platform =>
+        h.button(
+          [
+            h.OnClick(Message.ChangedShortcutPlatform({ platform })),
+            h.Class(
+              platform === model.shortcutPlatform
+                ? 'bg-sky-700 text-white rounded px-2 py-0.5'
+                : 'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-2 py-0.5',
+            ),
+            h.AriaPressed(
+              platform === model.shortcutPlatform ? 'true' : 'false',
+            ),
+            h.AriaLabel(
+              `${platform === 'macos' ? 'macOS' : 'Windows'} shortcut display`,
+            ),
+          ],
+          [platform === 'macos' ? 'macOS' : 'Windows'],
+        ),
+      ),
+    ],
+  )
+}
+
+function shortcutRow(
+  model: Model,
+  h: HtmlBuilder<Message>,
+  command: ShortcutCommand,
+): Html {
+  const recording = Option.getOrNull(model.recordingAction) === command.id
+  const binding = bindingFor(model.keymap, command)
+  const changed = !bindingsEqual(binding, command.defaultBinding)
+  return h.div(
+    [h.Class('flex items-center gap-2 px-3 py-2 border-b border-neutral-800')],
+    [
+      h.span([h.Class('flex-1 text-neutral-200')], [command.label]),
+      recording
+        ? h.span(
+            [h.Class('font-mono px-2 py-0.5 rounded text-amber-300')],
+            ['Press keys…'],
+          )
+        : h.span(
+            [
+              h.Class(
+                'font-mono px-2 py-0.5 bg-neutral-800 rounded text-neutral-300 min-w-24 text-center',
+              ),
+            ],
+            [formatShortcut(binding, model.shortcutPlatform)],
+          ),
+      recording
+        ? h.button(
+            [
+              h.OnClick(Message.CancelledShortcutRecording()),
+              h.Class(
+                'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-2 py-0.5',
+              ),
+              h.AriaLabel(`Cancel recording for ${command.label}`),
+            ],
+            ['Cancel'],
+          )
+        : h.button(
+            [
+              h.OnClick(
+                Message.StartedShortcutRecording({ actionId: command.id }),
+              ),
+              h.Class(
+                'bg-sky-700 hover:bg-sky-600 text-white rounded px-2 py-0.5',
+              ),
+              h.AriaLabel(`Record shortcut for ${command.label}`),
+            ],
+            ['Record'],
+          ),
+      changed
+        ? h.button(
+            [
+              h.OnClick(Message.ResetShortcut({ actionId: command.id })),
+              h.Class(
+                'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-2 py-0.5',
+              ),
+              h.AriaLabel(`Reset shortcut for ${command.label}`),
+            ],
+            ['Reset'],
+          )
+        : h.empty,
     ],
   )
 }

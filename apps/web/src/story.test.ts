@@ -2,6 +2,7 @@ import { Option } from 'effect'
 import { Command, given, message, model, story } from 'foldkit/story'
 import { describe, expect, test } from 'vitest'
 
+import { PersistSettings } from './editor/commands'
 import {
   Message,
   type Model,
@@ -661,6 +662,198 @@ describe('editor update', () => {
       model((m: Model) => {
         expect(m.past).toHaveLength(1)
         expect(m.status).toContain('Moved g1')
+      }),
+    )
+  })
+
+  test('settings open, close, and Escape closes them first', () => {
+    story(
+      update,
+      given(seedModel()),
+      model((m: Model) => {
+        expect(m.settingsOpen).toBe(false)
+      }),
+      message(Message.OpenedSettings()),
+      model((m: Model) => {
+        expect(m.settingsOpen).toBe(true)
+      }),
+      message(Message.PressedEscape()),
+      model((m: Model) => {
+        expect(m.settingsOpen).toBe(false)
+      }),
+      message(Message.PressedSettings()),
+      model((m: Model) => {
+        expect(m.settingsOpen).toBe(true)
+      }),
+      message(Message.ClosedSettings()),
+      model((m: Model) => {
+        expect(m.settingsOpen).toBe(false)
+      }),
+    )
+  })
+
+  test('recording a shortcut stores it and persists the settings', () => {
+    story(
+      update,
+      given(seedModel()),
+      message(Message.StartedShortcutRecording({ actionId: 'copy' })),
+      model((m: Model) => {
+        expect(Option.getOrNull(m.recordingAction)).toBe('copy')
+      }),
+      message(
+        Message.CapturedShortcut({
+          key: 'p',
+          ctrlKey: true,
+          metaKey: false,
+          altKey: false,
+          shiftKey: false,
+          isApple: false,
+        }),
+      ),
+      Command.resolve(PersistSettings, Message.CompletedPersistSettings()),
+      model((m: Model) => {
+        expect(m.keymap['copy']).toBe('Mod+p')
+        expect(Option.isNone(m.recordingAction)).toBe(true)
+        expect(m.status).toContain('Ctrl+P')
+      }),
+    )
+  })
+
+  test('a conflicting recording is rejected and stays active', () => {
+    story(
+      update,
+      given(seedModel()),
+      message(Message.StartedShortcutRecording({ actionId: 'paste' })),
+      message(
+        Message.CapturedShortcut({
+          key: 'c',
+          ctrlKey: true,
+          metaKey: false,
+          altKey: false,
+          shiftKey: false,
+          isApple: false,
+        }),
+      ),
+      Command.expectNone(),
+      model((m: Model) => {
+        expect(m.keymap['paste']).toBe('Mod+V')
+        expect(Option.getOrNull(m.recordingAction)).toBe('paste')
+        expect(m.status).toContain('already used')
+      }),
+    )
+  })
+
+  test('a modifier-only key press leaves recording active', () => {
+    story(
+      update,
+      given(seedModel()),
+      message(Message.StartedShortcutRecording({ actionId: 'copy' })),
+      message(
+        Message.CapturedShortcut({
+          key: 'Control',
+          ctrlKey: true,
+          metaKey: false,
+          altKey: false,
+          shiftKey: false,
+          isApple: false,
+        }),
+      ),
+      Command.expectNone(),
+      model((m: Model) => {
+        expect(m.keymap['copy']).toBe('Mod+C')
+        expect(Option.getOrNull(m.recordingAction)).toBe('copy')
+      }),
+    )
+  })
+
+  test('cancelling and resetting shortcuts', () => {
+    story(
+      update,
+      given({
+        ...seedModel(),
+        keymap: { ...seedModel().keymap, copy: 'Mod+P' },
+      }),
+      message(Message.StartedShortcutRecording({ actionId: 'copy' })),
+      message(Message.CancelledShortcutRecording()),
+      model((m: Model) => {
+        expect(Option.isNone(m.recordingAction)).toBe(true)
+        expect(m.keymap['copy']).toBe('Mod+P')
+      }),
+      message(Message.ResetShortcut({ actionId: 'copy' })),
+      Command.resolve(PersistSettings, Message.CompletedPersistSettings()),
+      model((m: Model) => {
+        expect(m.keymap['copy']).toBe('Mod+C')
+      }),
+    )
+  })
+
+  test('ResetAllShortcuts restores every default binding', () => {
+    story(
+      update,
+      given({
+        ...seedModel(),
+        keymap: { ...seedModel().keymap, copy: 'Mod+P', paste: 'Mod+U' },
+      }),
+      message(Message.ResetAllShortcuts()),
+      Command.resolve(PersistSettings, Message.CompletedPersistSettings()),
+      model((m: Model) => {
+        expect(m.keymap['copy']).toBe('Mod+C')
+        expect(m.keymap['paste']).toBe('Mod+V')
+      }),
+    )
+  })
+
+  test('ChangedShortcutPlatform switches display mode and persists', () => {
+    story(
+      update,
+      given(seedModel()),
+      message(Message.ChangedShortcutPlatform({ platform: 'macos' })),
+      Command.resolve(PersistSettings, Message.CompletedPersistSettings()),
+      model((m: Model) => {
+        expect(m.shortcutPlatform).toBe('macos')
+      }),
+      message(Message.ChangedShortcutPlatform({ platform: 'nope' })),
+      Command.expectNone(),
+      model((m: Model) => {
+        expect(m.shortcutPlatform).toBe('macos')
+      }),
+    )
+  })
+
+  test('CompletedLoadSettings applies a stored keymap', () => {
+    story(
+      update,
+      given(seedModel()),
+      message(
+        Message.CompletedLoadSettings({
+          json: JSON.stringify({
+            version: 1,
+            platform: 'macos',
+            keymap: { copy: 'Mod+P' },
+          }),
+        }),
+      ),
+      model((m: Model) => {
+        expect(m.shortcutPlatform).toBe('macos')
+        expect(m.keymap['copy']).toBe('Mod+P')
+        expect(m.keymap['paste']).toBe('Mod+V')
+      }),
+    )
+  })
+
+  test('seeding the demo graph preserves loaded settings', () => {
+    story(
+      update,
+      given({
+        ...emptyModel(),
+        shortcutPlatform: 'macos',
+        keymap: { ...emptyModel().keymap, copy: 'Mod+P' },
+      }),
+      message(Message.CompletedLoadEmpty()),
+      model((m: Model) => {
+        expect(m.nodes).toHaveLength(4)
+        expect(m.shortcutPlatform).toBe('macos')
+        expect(m.keymap['copy']).toBe('Mod+P')
       }),
     )
   })

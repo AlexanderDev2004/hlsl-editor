@@ -175,11 +175,16 @@ Connections are made by clicking an output port then an input port.
   `Ctrl/Cmd+G` group, `Ctrl/Cmd+Shift+G` ungroup, `Ctrl/Cmd+Z` undo,
   `Ctrl/Cmd+Shift+Z` or `Ctrl/Cmd+Y` redo, `Esc` cancels a pending wire and
   closes the add-node menu. Bindings are suppressed while typing in inputs.
+- Settings: the Settings button opens a panel listing every command. Click
+  Record and press the keys to rebind; a conflicting binding is rejected, Esc
+  cancels recording, and each row has a Reset. A Windows/macOS toggle controls
+  how shortcuts are displayed (`Ctrl+G` vs `⌘G`). Custom bindings persist in
+  browser storage and load on start.
 - Undo/redo for add, delete, move, group/ungroup, value change, connect
   (history is graph-only, capped at 100).
 - Save to browser storage, load on start, New, Export JSON, Import JSON
   (`{version: 1, nodes, edges, outputNodeId}`).
-- 89 tests: type system, graph, validation, HLSL generation (incl.
+- 99 tests: type system, graph, validation, HLSL generation (incl.
   determinism and unused-node exclusion), Foldkit story/scene tests.
 
 ## 12. MVP Roadmap
