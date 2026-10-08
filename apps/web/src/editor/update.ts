@@ -396,6 +396,7 @@ function cancelPending(model: Model): Model {
     pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
     contextMenu: () => Option.none(),
     nodeMenu: () => Option.none(),
+    drag: () => (model.drag.mode === 'wire' ? { mode: 'idle' } : model.drag),
     status: () => 'Connection cancelled.',
   })
 }
@@ -557,6 +558,102 @@ function attemptConnect(
     status: () =>
       `Connected ${fromNodeId}.${fromPort} to ${toNodeId}.${toPort}.`,
   })
+}
+
+// Direction of a named port on a node, or null when the node or port is
+// unknown. Shared by the wire-drag handlers.
+function portDirectionOf(
+  model: Model,
+  nodeId: string,
+  port: string,
+): 'in' | 'out' | null {
+  const node = model.nodes.find(n => n.id === nodeId)
+  if (node === undefined || !isNodeType(node.type)) {
+    return null
+  }
+  const def = NODE_REGISTRY[node.type]
+  if (def.inputs.some(p => p.name === port)) {
+    return 'in'
+  }
+  if (def.outputs.some(p => p.name === port)) {
+    return 'out'
+  }
+  return null
+}
+
+// Connects a freshly added node to the port a wire was dragged from, when the
+// wire was dropped on empty canvas. Best-effort: if no port on the new node
+// accepts the wire, the node is still added and a hint is left in the status.
+function autoConnectFromPending(model: Model, newNodeId: string): Model {
+  if (!model.pending.active) {
+    return model
+  }
+  const { fromNodeId, fromPort } = model.pending
+  const sourceDir = portDirectionOf(model, fromNodeId, fromPort)
+  const newNode = model.nodes.find(n => n.id === newNodeId)
+  if (
+    sourceDir === null ||
+    newNode === undefined ||
+    !isNodeType(newNode.type)
+  ) {
+    return model
+  }
+  const graph = toDomainGraph(model)
+  const sourceType = upstreamPortType(graph, fromNodeId, fromPort)
+  if (sourceType === null) {
+    return model
+  }
+  const newDef = NODE_REGISTRY[newNode.type]
+  if (sourceDir === 'out') {
+    const target = newDef.inputs.find(input =>
+      (input.accepts ?? [input.valueType]).some(t => canConnect(sourceType, t)),
+    )
+    if (target === undefined) {
+      return withStatus(
+        model,
+        `Added ${newNode.type}. Connect an input to ${fromNodeId}.${fromPort}.`,
+      )
+    }
+    return attemptConnect(model, fromNodeId, fromPort, newNodeId, target.name)
+  }
+  const sourceNode = model.nodes.find(n => n.id === fromNodeId)
+  const sourceDef =
+    sourceNode !== undefined && isNodeType(sourceNode.type)
+      ? NODE_REGISTRY[sourceNode.type]
+      : null
+  const sourceInput = sourceDef?.inputs.find(i => i.name === fromPort)
+  const allowed =
+    sourceInput?.accepts ??
+    (sourceInput !== undefined ? [sourceInput.valueType] : [])
+  const output = newDef.outputs.find(out => {
+    const outType = upstreamPortType(graph, newNodeId, out.name)
+    return outType !== null && allowed.some(t => canConnect(outType, t))
+  })
+  if (output === undefined) {
+    return withStatus(
+      model,
+      `Added ${newNode.type}. Connect its output to ${fromNodeId}.${fromPort}.`,
+    )
+  }
+  return attemptConnect(model, newNodeId, output.name, fromNodeId, fromPort)
+}
+
+// Topmost visible node whose bounds contain a world point, or null. Used to
+// decide whether a wire dropped on the canvas landed on empty space.
+function nodeAtWorldPoint(model: Model, x: number, y: number): string | null {
+  const hidden = hiddenNodeIds(model)
+  const found = [...model.nodes].reverse().find(n => {
+    if (hidden.has(n.id) || !isNodeType(n.type)) {
+      return false
+    }
+    return (
+      x >= n.position.x &&
+      x <= n.position.x + nodeWidth(n.type) &&
+      y >= n.position.y &&
+      y <= n.position.y + nodeHeight(n.type)
+    )
+  })
+  return found?.id ?? null
 }
 
 function nextRerouteName(model: Model): string {
@@ -1069,6 +1166,104 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         }),
       }),
     }),
+    StartedWireDrag: ({
+      nodeId,
+      port,
+      direction,
+      screenX,
+      screenY,
+      worldX,
+      worldY,
+      clientX,
+      clientY,
+    }) => {
+      // A click already armed a wire: pressing a compatible port connects it.
+      if (model.pending.active) {
+        const pendingDir = portDirectionOf(
+          model,
+          model.pending.fromNodeId,
+          model.pending.fromPort,
+        )
+        if (pendingDir !== null && pendingDir !== direction) {
+          return {
+            model: attemptConnect(
+              model,
+              pendingDir === 'out' ? model.pending.fromNodeId : nodeId,
+              pendingDir === 'out' ? model.pending.fromPort : port,
+              pendingDir === 'out' ? nodeId : model.pending.fromNodeId,
+              pendingDir === 'out' ? port : model.pending.fromPort,
+            ),
+          }
+        }
+      }
+      return {
+        model: modifyFields(model, {
+          pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
+          contextMenu: () => Option.none(),
+          nodeMenu: () => Option.none(),
+          drag: () => ({
+            mode: 'wire',
+            fromNodeId: nodeId,
+            fromPort: port,
+            fromDirection: direction,
+            lastX: screenX,
+            lastY: screenY,
+            worldX,
+            worldY,
+            clientX,
+            clientY,
+            moved: false,
+          }),
+          status: () =>
+            direction === 'out'
+              ? 'Drag to an input port, or drop on empty canvas to add a node.'
+              : 'Drag to an output port, or drop on empty canvas to add a node.',
+        }),
+      }
+    },
+    DroppedWireOnPort: ({ nodeId, port }) => {
+      if (model.drag.mode !== 'wire') {
+        return { model }
+      }
+      const drag = model.drag
+      const targetDir = portDirectionOf(model, nodeId, port)
+      const samePort = nodeId === drag.fromNodeId && port === drag.fromPort
+      if (targetDir === null) {
+        return {
+          model: modifyFields(model, { drag: () => ({ mode: 'idle' }) }),
+        }
+      }
+      // Released without moving: treat it as a click and arm click-to-connect.
+      if (samePort && !drag.moved) {
+        return {
+          model: modifyFields(model, {
+            drag: () => ({ mode: 'idle' }),
+            pending: () => ({
+              active: true,
+              fromNodeId: nodeId,
+              fromPort: port,
+            }),
+            status: () =>
+              `Connecting from ${nodeId}.${port}. Click a compatible port.`,
+          }),
+        }
+      }
+      if (targetDir === drag.fromDirection) {
+        return {
+          model: modifyFields(model, {
+            drag: () => ({ mode: 'idle' }),
+            status: () => 'Connection cancelled.',
+          }),
+        }
+      }
+      const connected =
+        drag.fromDirection === 'out'
+          ? attemptConnect(model, drag.fromNodeId, drag.fromPort, nodeId, port)
+          : attemptConnect(model, nodeId, port, drag.fromNodeId, drag.fromPort)
+      return {
+        model: modifyFields(connected, { drag: () => ({ mode: 'idle' }) }),
+      }
+    },
     MovedPointer: ({ x, y }) => {
       if (model.drag.mode === 'node') {
         const drag = model.drag
@@ -1172,9 +1367,78 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           }),
         }
       }
+      if (model.drag.mode === 'wire') {
+        const drag = model.drag
+        const zoom = model.viewport.zoom
+        const dx = x - drag.lastX
+        const dy = y - drag.lastY
+        if (dx === 0 && dy === 0) {
+          return { model }
+        }
+        return {
+          model: modifyFields(model, {
+            drag: () =>
+              modifyFields(drag, {
+                lastX: () => x,
+                lastY: () => y,
+                moved: () => drag.moved || Math.abs(dx) > 2 || Math.abs(dy) > 2,
+                worldX: () => drag.worldX + dx / zoom,
+                worldY: () => drag.worldY + dy / zoom,
+                clientX: () => drag.clientX + dx,
+                clientY: () => drag.clientY + dy,
+              }),
+          }),
+        }
+      }
       return { model }
     },
     EndedDrag: () => {
+      if (model.drag.mode === 'wire') {
+        const drag = model.drag
+        if (!drag.moved) {
+          // A click on a port arms click-to-connect rather than opening a menu.
+          return {
+            model: modifyFields(model, {
+              drag: () => ({ mode: 'idle' }),
+              pending: () => ({
+                active: true,
+                fromNodeId: drag.fromNodeId,
+                fromPort: drag.fromPort,
+              }),
+              status: () =>
+                `Connecting from ${drag.fromNodeId}.${drag.fromPort}. Click a compatible port.`,
+            }),
+          }
+        }
+        // Dropped on empty canvas: offer to add a node wired to the source.
+        if (nodeAtWorldPoint(model, drag.worldX, drag.worldY) !== null) {
+          return {
+            model: modifyFields(model, {
+              drag: () => ({ mode: 'idle' }),
+              status: () => 'Connection cancelled.',
+            }),
+          }
+        }
+        return {
+          model: modifyFields(model, {
+            drag: () => ({ mode: 'idle' }),
+            contextMenu: () =>
+              Option.some({
+                worldX: drag.worldX,
+                worldY: drag.worldY,
+                clientX: drag.clientX,
+                clientY: drag.clientY,
+                search: '',
+              }),
+            pending: () => ({
+              active: true,
+              fromNodeId: drag.fromNodeId,
+              fromPort: drag.fromPort,
+            }),
+            status: () => 'Pick a node to add and connect to the wire.',
+          }),
+        }
+      }
       if (model.drag.mode === 'marquee') {
         const drag = model.drag
         if (!drag.moved) {
@@ -1584,11 +1848,11 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       if (menu === null) {
         return { model }
       }
-      return {
-        model: closeContextMenu(
-          addNodeAt(model, nodeType, menu.worldX, menu.worldY),
-        ),
-      }
+      const added = addNodeAt(model, nodeType, menu.worldX, menu.worldY)
+      const newId = added.selectedNodeIds[0]
+      const connected =
+        newId === undefined ? added : autoConnectFromPending(added, newId)
+      return { model: closeContextMenu(connected) }
     },
     DismissedContextMenu: () => ({ model: closeContextMenu(model) }),
     PreventedNativeContextMenu: () => ({ model }),

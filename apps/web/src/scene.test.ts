@@ -8,6 +8,7 @@ import {
   given,
   hover,
   pointerDown,
+  pointerUp,
   role,
   scene,
   selector,
@@ -214,6 +215,25 @@ describe('editor view', () => {
       expect(role('textbox', { name: 'Collapsed name' })).toExist(),
       click(role('button', { name: 'Expand' })),
       expect(selector('.collapsed-node')).toBeAbsent(),
+    )
+  })
+
+  test('pressing a port starts a live wire preview', () => {
+    scene(
+      { update, view },
+      given({ ...seedModel(), edges: [] }),
+      pointerDown(selector('.graph-port-out'), { clientX: 100, clientY: 140 }),
+      expect(selector('.wire-preview')).toExist(),
+    )
+  })
+
+  test('dragging a wire from a port to a port connects the nodes', () => {
+    scene(
+      { update, view },
+      given({ ...seedModel(), edges: [] }),
+      pointerDown(selector('.graph-port-out'), { clientX: 100, clientY: 140 }),
+      pointerUp(selector('.graph-port-in')),
+      expect(text('Connected n1.out to n3.a.')).toExist(),
     )
   })
 })

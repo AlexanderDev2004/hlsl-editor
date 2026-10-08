@@ -1238,4 +1238,144 @@ describe('editor update', () => {
       }),
     )
   })
+
+  test('dragging a wire from an output to an input connects the nodes', () => {
+    story(
+      update,
+      given(emptyModel()),
+      message(Message.RequestedAddNode({ x: 0, y: 0 })),
+      message(Message.ChangedNewNodeType({ nodeType: 'Multiply' })),
+      message(Message.RequestedAddNode({ x: 400, y: 0 })),
+      message(
+        Message.StartedWireDrag({
+          nodeId: 'n1',
+          port: 'out',
+          direction: 'out',
+          screenX: 0,
+          screenY: 0,
+          worldX: 0,
+          worldY: 0,
+          clientX: 0,
+          clientY: 0,
+        }),
+      ),
+      message(Message.MovedPointer({ x: 120, y: 20 })),
+      message(Message.DroppedWireOnPort({ nodeId: 'n2', port: 'a' })),
+      model((m: Model) => {
+        expect(m.edges).toHaveLength(1)
+        expect(m.status).toContain('Connected n1.out to n2.a')
+        expect(m.drag.mode).toBe('idle')
+      }),
+    )
+  })
+
+  test('dragging from an input to an output connects the nodes', () => {
+    story(
+      update,
+      given(emptyModel()),
+      message(Message.RequestedAddNode({ x: 0, y: 0 })),
+      message(Message.ChangedNewNodeType({ nodeType: 'Multiply' })),
+      message(Message.RequestedAddNode({ x: 400, y: 0 })),
+      message(
+        Message.StartedWireDrag({
+          nodeId: 'n2',
+          port: 'a',
+          direction: 'in',
+          screenX: 0,
+          screenY: 0,
+          worldX: 0,
+          worldY: 0,
+          clientX: 0,
+          clientY: 0,
+        }),
+      ),
+      message(Message.MovedPointer({ x: -120, y: -20 })),
+      message(Message.DroppedWireOnPort({ nodeId: 'n1', port: 'out' })),
+      model((m: Model) => {
+        expect(m.edges).toHaveLength(1)
+        expect(m.status).toContain('Connected n1.out to n2.a')
+      }),
+    )
+  })
+
+  test('clicking a port then a target still connects through the wire state', () => {
+    story(
+      update,
+      given(emptyModel()),
+      message(Message.RequestedAddNode({ x: 0, y: 0 })),
+      message(Message.ChangedNewNodeType({ nodeType: 'Multiply' })),
+      message(Message.RequestedAddNode({ x: 400, y: 0 })),
+      message(
+        Message.StartedWireDrag({
+          nodeId: 'n1',
+          port: 'out',
+          direction: 'out',
+          screenX: 0,
+          screenY: 0,
+          worldX: 0,
+          worldY: 0,
+          clientX: 0,
+          clientY: 0,
+        }),
+      ),
+      message(Message.DroppedWireOnPort({ nodeId: 'n1', port: 'out' })),
+      model((m: Model) => {
+        expect(m.pending.active).toBe(true)
+        expect(m.drag.mode).toBe('idle')
+      }),
+      message(
+        Message.StartedWireDrag({
+          nodeId: 'n2',
+          port: 'a',
+          direction: 'in',
+          screenX: 0,
+          screenY: 0,
+          worldX: 0,
+          worldY: 0,
+          clientX: 0,
+          clientY: 0,
+        }),
+      ),
+      model((m: Model) => {
+        expect(m.edges).toHaveLength(1)
+        expect(m.pending.active).toBe(false)
+      }),
+    )
+  })
+
+  test('dropping a wire on empty canvas offers a node that auto-connects', () => {
+    story(
+      update,
+      given(emptyModel()),
+      message(Message.RequestedAddNode({ x: 0, y: 0 })),
+      message(
+        Message.StartedWireDrag({
+          nodeId: 'n1',
+          port: 'out',
+          direction: 'out',
+          screenX: 0,
+          screenY: 0,
+          worldX: 0,
+          worldY: 0,
+          clientX: 0,
+          clientY: 0,
+        }),
+      ),
+      message(Message.MovedPointer({ x: 240, y: 160 })),
+      message(Message.EndedDrag()),
+      model((m: Model) => {
+        expect(Option.isSome(m.contextMenu)).toBe(true)
+        expect(m.pending.active).toBe(true)
+        expect(m.pending.fromNodeId).toBe('n1')
+      }),
+      message(Message.SelectedContextMenuNode({ nodeType: 'Multiply' })),
+      model((m: Model) => {
+        expect(m.nodes).toHaveLength(2)
+        expect(m.edges).toHaveLength(1)
+        expect(m.edges[0]?.targetNodeId).toBe('n2')
+        expect(m.edges[0]?.targetPort).toBe('a')
+        expect(m.status).toContain('Connected n1.out to n2.a')
+      }),
+    )
+  })
 })

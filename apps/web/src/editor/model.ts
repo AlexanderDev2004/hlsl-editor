@@ -134,6 +134,22 @@ export const DragState = Schema.Union([
     currentWorldY: Schema.Number,
     worldPerPixel: Schema.Number,
   }),
+  // Dragging a wire out of a port. `fromDirection` is the direction of the
+  // port the drag started from; releasing on an opposite-direction port
+  // connects, releasing on empty canvas offers to add a node there.
+  Schema.Struct({
+    mode: Schema.Literal('wire'),
+    fromNodeId: Schema.String,
+    fromPort: Schema.String,
+    fromDirection: Schema.Union([Schema.Literal('in'), Schema.Literal('out')]),
+    lastX: Schema.Number,
+    lastY: Schema.Number,
+    worldX: Schema.Number,
+    worldY: Schema.Number,
+    clientX: Schema.Number,
+    clientY: Schema.Number,
+    moved: Schema.Boolean,
+  }),
 ])
 export type DragState = typeof DragState.Type
 

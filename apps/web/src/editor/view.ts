@@ -1054,6 +1054,31 @@ function canvasView(
                   ),
                 ],
           ),
+          model.drag.mode === 'wire'
+            ? (() => {
+                const drag = model.drag
+                const source = model.nodes.find(n => n.id === drag.fromNodeId)
+                const from =
+                  source === undefined
+                    ? null
+                    : portPosition(source, drag.fromPort, drag.fromDirection)
+                return from === null
+                  ? h.empty
+                  : h.path([
+                      h.D(
+                        String(
+                          edgePath(from.x, from.y, drag.worldX, drag.worldY),
+                        ),
+                      ),
+                      h.Fill('none'),
+                      h.Stroke(HIGHLIGHT_COLOR),
+                      h.StrokeWidth('2.5'),
+                      h.StrokeDasharray('6 4'),
+                      h.PointerEvents('none'),
+                      h.Class('wire-preview'),
+                    ])
+              })()
+            : h.empty,
         ],
       ),
       minimapView(model, h),
@@ -1545,8 +1570,42 @@ function nodeView(
             h.Stroke('#0d1117'),
             h.StrokeWidth('2'),
             h.Cursor('pointer'),
-            h.OnClick(
-              Message.ClickedPort({ nodeId: node.id, port: port.name }),
+            h.Class('graph-port graph-port-in'),
+            h.OnPointerDown(
+              (
+                _pointerType,
+                button,
+                screenX,
+                screenY,
+                _timeStamp,
+                clientX,
+                clientY,
+                _pointerId,
+                target,
+              ) => {
+                if (button !== 0) {
+                  return Option.none()
+                }
+                const start = pointerToWorld(model, target, clientX, clientY)
+                return Option.some(
+                  Message.StartedWireDrag({
+                    nodeId: node.id,
+                    port: port.name,
+                    direction: 'in',
+                    screenX,
+                    screenY,
+                    worldX: start.x,
+                    worldY: start.y,
+                    clientX,
+                    clientY,
+                  }),
+                )
+              },
+            ),
+            h.OnPointerUp(() =>
+              Option.some(
+                Message.DroppedWireOnPort({ nodeId: node.id, port: port.name }),
+              ),
             ),
           ]),
           h.text(
@@ -1585,8 +1644,42 @@ function nodeView(
             h.Stroke(isArmed ? '#ffffff' : '#0d1117'),
             h.StrokeWidth('2'),
             h.Cursor('pointer'),
-            h.OnClick(
-              Message.ClickedPort({ nodeId: node.id, port: port.name }),
+            h.Class('graph-port graph-port-out'),
+            h.OnPointerDown(
+              (
+                _pointerType,
+                button,
+                screenX,
+                screenY,
+                _timeStamp,
+                clientX,
+                clientY,
+                _pointerId,
+                target,
+              ) => {
+                if (button !== 0) {
+                  return Option.none()
+                }
+                const start = pointerToWorld(model, target, clientX, clientY)
+                return Option.some(
+                  Message.StartedWireDrag({
+                    nodeId: node.id,
+                    port: port.name,
+                    direction: 'out',
+                    screenX,
+                    screenY,
+                    worldX: start.x,
+                    worldY: start.y,
+                    clientX,
+                    clientY,
+                  }),
+                )
+              },
+            ),
+            h.OnPointerUp(() =>
+              Option.some(
+                Message.DroppedWireOnPort({ nodeId: node.id, port: port.name }),
+              ),
             ),
           ]),
         ]
