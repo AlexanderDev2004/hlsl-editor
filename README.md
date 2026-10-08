@@ -154,6 +154,11 @@ Connections are made by clicking an output port then an input port.
 - Copy/paste: `Ctrl/Cmd+C` copies the selected nodes and the wires between
   them, `Ctrl/Cmd+V` pastes duplicates (fresh ids, cascading offset) and
   selects them.
+- Grouping: select nodes and press `Ctrl/Cmd+G` (or the Group button) to wrap
+  them in a named, colored comment box. Rename and recolor it in the
+  Inspector, drag its header to move every member, or press
+  `Ctrl/Cmd+Shift+G` (or Ungroup) to remove the frame. A node belongs to at
+  most one group; deleting its last member removes the group.
 - Node status indicator: every node shows a derived status
   (`initial`/`success`/`warning`/`error`), with `loading` simulated from the
   toolbar in `border` or `overlay` variant.
@@ -167,14 +172,14 @@ Connections are made by clicking an output port then an input port.
 - Panels: Generated HLSL (copy button, clear error state), Problems list
   (click an id to select the node), status bar.
 - Keyboard: `Delete`/`Backspace` delete, `Ctrl/Cmd+C`/`Ctrl/Cmd+V` copy/paste,
-  `Ctrl/Cmd+Z` undo, `Ctrl/Cmd+Shift+Z` or `Ctrl/Cmd+Y` redo, `Esc` cancels a
-  pending wire and closes the add-node menu. Bindings are suppressed while
-  typing in inputs.
-- Undo/redo for add, delete, move, value change, connect (history is
-  graph-only, capped at 100).
+  `Ctrl/Cmd+G` group, `Ctrl/Cmd+Shift+G` ungroup, `Ctrl/Cmd+Z` undo,
+  `Ctrl/Cmd+Shift+Z` or `Ctrl/Cmd+Y` redo, `Esc` cancels a pending wire and
+  closes the add-node menu. Bindings are suppressed while typing in inputs.
+- Undo/redo for add, delete, move, group/ungroup, value change, connect
+  (history is graph-only, capped at 100).
 - Save to browser storage, load on start, New, Export JSON, Import JSON
   (`{version: 1, nodes, edges, outputNodeId}`).
-- 80 tests: type system, graph, validation, HLSL generation (incl.
+- 89 tests: type system, graph, validation, HLSL generation (incl.
   determinism and unused-node exclusion), Foldkit story/scene tests.
 
 ## 12. MVP Roadmap

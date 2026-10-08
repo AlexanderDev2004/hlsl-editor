@@ -16,12 +16,14 @@ import {
   PersistGraph,
   PickImportFile,
 } from './commands'
+import { DEFAULT_GROUP_COLOR, GROUP_COLORS } from './groups'
 import { ZOOM_STEP, clampZoom } from './layout'
 import { nodesInRect, worldRect } from './marquee'
 import { Message } from './message'
 import {
   type EditorEdge,
   type EditorNode,
+  type Group,
   type Model,
   emptyModel,
   fromSerialized,
@@ -213,22 +215,26 @@ function applyImported(model: Model, text: string, pushUndo: boolean): Model {
   return modifyFields(base, {
     nodes: () => restored.nodes,
     edges: () => restored.edges,
+    groups: () => [],
     outputNodeId: () => restored.outputNodeId,
     nextNode: () => restored.nextNode,
     nextEdge: () => restored.nextEdge,
+    nextGroup: () => 1,
     selectedNodeIds: () => [],
+    selectedGroupId: () => Option.none(),
     pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
     status: () => `Imported graph with ${restored.nodes.length} nodes.`,
   })
 }
 
-// Removes the selected nodes and/or the selected edge in one history entry.
+// Removes the selected nodes, edge, or group in one history entry.
 // Deleting an edge only drops the wire; its nodes stay, so the user can
-// connect them again.
+// connect them again. Deleting a group removes the frame only.
 function deleteSelection(model: Model): Model {
   const nodeIds = model.selectedNodeIds
   const edgeId = Option.getOrNull(model.selectedEdgeId)
-  if (nodeIds.length === 0 && edgeId === null) {
+  const groupId = Option.getOrNull(model.selectedGroupId)
+  if (nodeIds.length === 0 && edgeId === null && groupId === null) {
     return withStatus(model, 'Nothing selected to delete.')
   }
   const gone = new Set(nodeIds)
@@ -237,19 +243,31 @@ function deleteSelection(model: Model): Model {
     e =>
       e.id !== edgeId && !gone.has(e.sourceNodeId) && !gone.has(e.targetNodeId),
   )
+  // Drop deleted nodes from every group, and remove any group left empty.
+  const groups = model.groups
+    .filter(group => group.id !== groupId)
+    .map(group => ({
+      ...group,
+      nodeIds: group.nodeIds.filter(id => !gone.has(id)),
+    }))
+    .filter(group => group.nodeIds.length > 0)
   const outputId = Option.getOrNull(model.outputNodeId)
   const outputGone = outputId !== null && gone.has(outputId)
   const base = pushHistory(model)
   const status =
     nodeIds.length > 0
       ? `Deleted ${nodeIds.length} node${nodeIds.length === 1 ? '' : 's'}.`
-      : `Deleted edge ${edgeId ?? ''}.`
+      : groupId !== null
+        ? `Deleted ${groupId}.`
+        : `Deleted edge ${edgeId ?? ''}.`
   return modifyFields(base, {
     nodes: () => nodes,
     edges: () => edges,
+    groups: () => groups,
     outputNodeId: () => (outputGone ? Option.none() : model.outputNodeId),
     selectedNodeIds: () => [],
     selectedEdgeId: () => Option.none(),
+    selectedGroupId: () => Option.none(),
     pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
     status: () => status,
   })
@@ -257,6 +275,54 @@ function deleteSelection(model: Model): Model {
 
 function closeContextMenu(model: Model): Model {
   return modifyFields(model, { contextMenu: () => Option.none() })
+}
+
+// Wraps the selected nodes in a named, colored group. Membership only — the
+// frame is derived from the member nodes' positions.
+function groupSelection(model: Model): Model {
+  const members = model.selectedNodeIds
+  if (members.length === 0) {
+    return withStatus(model, 'Select nodes to group first.')
+  }
+  const id = `g${model.nextGroup}`
+  const group: Group = {
+    id,
+    name: `Group ${model.nextGroup}`,
+    color: DEFAULT_GROUP_COLOR,
+    nodeIds: [...members],
+  }
+  // A node belongs to at most one group, so drop it from any existing group
+  // and prune groups left empty.
+  const groups = model.groups
+    .map(existing => ({
+      ...existing,
+      nodeIds: existing.nodeIds.filter(nodeId => !members.includes(nodeId)),
+    }))
+    .filter(existing => existing.nodeIds.length > 0)
+  const base = pushHistory(model)
+  return modifyFields(base, {
+    groups: () => [...groups, group],
+    nextGroup: () => model.nextGroup + 1,
+    selectedGroupId: () => Option.some(id),
+    selectedNodeIds: () => [],
+    selectedEdgeId: () => Option.none(),
+    status: () =>
+      `Grouped ${members.length} node${members.length === 1 ? '' : 's'}.`,
+  })
+}
+
+// Removes the selected group (the frame only; its nodes stay).
+function ungroupSelected(model: Model): Model {
+  const groupId = Option.getOrNull(model.selectedGroupId)
+  if (groupId === null) {
+    return withStatus(model, 'Select a group to ungroup.')
+  }
+  const base = pushHistory(model)
+  return modifyFields(base, {
+    groups: () => model.groups.filter(group => group.id !== groupId),
+    selectedGroupId: () => Option.none(),
+    status: () => `Ungrouped ${groupId}.`,
+  })
 }
 
 // Shared by the toolbar "Add node" button and the right-click menu. Validates
@@ -445,6 +511,22 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         }),
       }),
     }),
+    StartedGroupDrag: ({ groupId, x, y }) => ({
+      model: modifyFields(model, {
+        selectedGroupId: () => Option.some(groupId),
+        selectedNodeIds: () => [],
+        selectedEdgeId: () => Option.none(),
+        contextMenu: () => Option.none(),
+        drag: () => ({
+          mode: 'group',
+          groupId,
+          lastX: x,
+          lastY: y,
+          moved: false,
+          before: takeSnapshot(model),
+        }),
+      }),
+    }),
     StartedMarquee: ({ worldX, worldY, worldPerPixel, screenX, screenY }) => ({
       model: modifyFields(model, {
         contextMenu: () => Option.none(),
@@ -510,6 +592,36 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           }),
         }
       }
+      if (model.drag.mode === 'group') {
+        const drag = model.drag
+        const zoom = model.viewport.zoom
+        const dx = (x - drag.lastX) / zoom
+        const dy = (y - drag.lastY) / zoom
+        if (dx === 0 && dy === 0) {
+          return { model }
+        }
+        const group = model.groups.find(g => g.id === drag.groupId)
+        const memberIds = new Set(group?.nodeIds ?? [])
+        return {
+          model: modifyFields(model, {
+            nodes: () =>
+              model.nodes.map(n =>
+                memberIds.has(n.id)
+                  ? {
+                      ...n,
+                      position: { x: n.position.x + dx, y: n.position.y + dy },
+                    }
+                  : n,
+              ),
+            drag: () =>
+              modifyFields(drag, {
+                lastX: () => x,
+                lastY: () => y,
+                moved: () => true,
+              }),
+          }),
+        }
+      }
       if (model.drag.mode === 'pan') {
         const drag = model.drag
         const zoom = model.viewport.zoom
@@ -545,6 +657,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
               drag: () => ({ mode: 'idle' }),
               selectedNodeIds: () => [],
               selectedEdgeId: () => Option.none(),
+              selectedGroupId: () => Option.none(),
               pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
             }),
           }
@@ -563,6 +676,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
             drag: () => ({ mode: 'idle' }),
             selectedNodeIds: () => ids,
             selectedEdgeId: () => Option.none(),
+            selectedGroupId: () => Option.none(),
             suppressClick: () => true,
             status: () =>
               `Selected ${ids.length} node${ids.length === 1 ? '' : 's'}.`,
@@ -572,6 +686,26 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       if (model.drag.mode === 'node' && model.drag.moved) {
         const before = model.drag.before
         const movedId = model.drag.nodeId
+        const past = [...model.past, before]
+        const trimmed = past.length > 100 ? past.slice(past.length - 100) : past
+        return {
+          model: modifyFields(model, {
+            drag: () => ({ mode: 'idle' }),
+            past: () => trimmed,
+            future: () => [],
+            suppressClick: () => true,
+            status: () => `Moved ${movedId}.`,
+          }),
+        }
+      }
+      if (model.drag.mode === 'group') {
+        if (!model.drag.moved) {
+          return {
+            model: modifyFields(model, { drag: () => ({ mode: 'idle' }) }),
+          }
+        }
+        const before = model.drag.before
+        const movedId = model.drag.groupId
         const past = [...model.past, before]
         const trimmed = past.length > 100 ? past.slice(past.length - 100) : past
         return {
@@ -625,6 +759,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         model: modifyFields(model, {
           selectedNodeIds: () => [nodeId],
           selectedEdgeId: () => Option.none(),
+          selectedGroupId: () => Option.none(),
           contextMenu: () => Option.none(),
         }),
       }
@@ -650,6 +785,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         model: modifyFields(model, {
           selectedEdgeId: () => Option.some(edgeId),
           selectedNodeIds: () => [],
+          selectedGroupId: () => Option.none(),
           pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
           contextMenu: () => Option.none(),
           status: () => `Selected edge ${edgeId}. Press Delete to remove it.`,
@@ -729,6 +865,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
           Option.some({ worldX, worldY, clientX, clientY, search: '' }),
         selectedNodeIds: () => [],
         selectedEdgeId: () => Option.none(),
+        selectedGroupId: () => Option.none(),
         pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
       }),
     }),
@@ -756,6 +893,51 @@ export const update = (model: Model, message: Message): UpdateReturn =>
     },
     DismissedContextMenu: () => ({ model: closeContextMenu(model) }),
     PreventedNativeContextMenu: () => ({ model }),
+    SelectedGroup: ({ groupId }) => {
+      const group = model.groups.find(g => g.id === groupId)
+      if (group === undefined) {
+        return { model }
+      }
+      return {
+        model: modifyFields(model, {
+          selectedGroupId: () => Option.some(groupId),
+          selectedNodeIds: () => [],
+          selectedEdgeId: () => Option.none(),
+          status: () => `Selected ${group.name}.`,
+        }),
+      }
+    },
+    PressedGroupSelection: () => ({ model: groupSelection(model) }),
+    PressedUngroupSelection: () => ({ model: ungroupSelected(model) }),
+    RenamedGroup: ({ groupId, name }) => {
+      if (model.groups.every(group => group.id !== groupId)) {
+        return { model }
+      }
+      return {
+        model: modifyFields(model, {
+          groups: () =>
+            model.groups.map(group =>
+              group.id === groupId ? { ...group, name } : group,
+            ),
+        }),
+      }
+    },
+    ChangedGroupColor: ({ groupId, color }) => {
+      if (!GROUP_COLORS.includes(color)) {
+        return { model }
+      }
+      if (model.groups.every(group => group.id !== groupId)) {
+        return { model }
+      }
+      return {
+        model: modifyFields(model, {
+          groups: () =>
+            model.groups.map(group =>
+              group.id === groupId ? { ...group, color } : group,
+            ),
+        }),
+      }
+    },
     ToggledMinimap: () => ({
       model: modifyFields(model, {
         minimapVisible: () => !model.minimapVisible,
@@ -966,10 +1148,13 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         model: modifyFields(model, {
           nodes: () => restored.nodes,
           edges: () => restored.edges,
+          groups: () => [],
           outputNodeId: () => restored.outputNodeId,
           nextNode: () => restored.nextNode,
           nextEdge: () => restored.nextEdge,
+          nextGroup: () => 1,
           selectedNodeIds: () => [],
+          selectedGroupId: () => Option.none(),
           status: () =>
             `Loaded saved graph with ${restored.nodes.length} nodes.`,
         }),
@@ -988,10 +1173,13 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         model: modifyFields(base, {
           nodes: () => [],
           edges: () => [],
+          groups: () => [],
           outputNodeId: () => Option.none(),
           nextNode: () => 1,
           nextEdge: () => 1,
+          nextGroup: () => 1,
           selectedNodeIds: () => [],
+          selectedGroupId: () => Option.none(),
           pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
           status: () => 'New graph. Add nodes from the palette.',
         }),

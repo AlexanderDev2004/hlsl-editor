@@ -19,6 +19,11 @@ export const subscriptions = Subscription.make<Model, Message>()(entry => ({
             { keys: 'Escape', mapEvent: () => Message.CancelledPending() },
             { keys: 'Mod+C', mapEvent: () => Message.PressedCopy() },
             { keys: 'Mod+V', mapEvent: () => Message.PressedPaste() },
+            { keys: 'Mod+G', mapEvent: () => Message.PressedGroupSelection() },
+            {
+              keys: 'Mod+Shift+G',
+              mapEvent: () => Message.PressedUngroupSelection(),
+            },
             { keys: 'Mod+Z', mapEvent: () => Message.PressedUndo() },
             { keys: 'Mod+Shift+Z', mapEvent: () => Message.PressedRedo() },
             { keys: 'Mod+Y', mapEvent: () => Message.PressedRedo() },

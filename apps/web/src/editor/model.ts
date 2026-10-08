@@ -33,12 +33,25 @@ export const EditorEdge = Schema.Struct({
 })
 export type EditorEdge = typeof EditorEdge.Type
 
+// A named, colored frame around a set of nodes (Unreal-style comment box).
+// Membership is by id; the frame's bounds are derived from the member nodes,
+// so it follows them as they move. Edges between members render inside it.
+export const Group = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  color: Schema.String,
+  nodeIds: Schema.Array(Schema.String),
+})
+export type Group = typeof Group.Type
+
 export const Snapshot = Schema.Struct({
   nodes: Schema.Array(EditorNode),
   edges: Schema.Array(EditorEdge),
+  groups: Schema.Array(Group),
   outputNodeId: Schema.Option(Schema.String),
   nextNode: Schema.Number,
   nextEdge: Schema.Number,
+  nextGroup: Schema.Number,
 })
 export type Snapshot = typeof Snapshot.Type
 
@@ -80,6 +93,14 @@ export const DragState = Schema.Union([
     origY: Schema.Number,
   }),
   Schema.Struct({
+    mode: Schema.Literal('group'),
+    groupId: Schema.String,
+    lastX: Schema.Number,
+    lastY: Schema.Number,
+    moved: Schema.Boolean,
+    before: Snapshot,
+  }),
+  Schema.Struct({
     mode: Schema.Literal('marquee'),
     lastX: Schema.Number,
     lastY: Schema.Number,
@@ -111,6 +132,9 @@ export const Model = Schema.Struct({
   selectedNodeIds: Schema.Array(Schema.String),
   selectedEdgeId: Schema.Option(Schema.String),
   hoveredEdgeId: Schema.Option(Schema.String),
+  groups: Schema.Array(Group),
+  selectedGroupId: Schema.Option(Schema.String),
+  nextGroup: Schema.Number,
   viewport: Schema.Struct({
     x: Schema.Number,
     y: Schema.Number,
@@ -188,6 +212,9 @@ export function seedModel(): Model {
     selectedNodeIds: [],
     selectedEdgeId: Option.none(),
     hoveredEdgeId: Option.none(),
+    groups: [],
+    selectedGroupId: Option.none(),
+    nextGroup: 1,
     viewport: { x: 0, y: 0, zoom: 1 },
     drag: { mode: 'idle' },
     pending: { active: false, fromNodeId: '', fromPort: '' },
@@ -223,9 +250,11 @@ export function takeSnapshot(model: Model): Snapshot {
   return {
     nodes: model.nodes,
     edges: model.edges,
+    groups: model.groups,
     outputNodeId: model.outputNodeId,
     nextNode: model.nextNode,
     nextEdge: model.nextEdge,
+    nextGroup: model.nextGroup,
   }
 }
 
@@ -239,12 +268,15 @@ export function restoreSnapshot(model: Model, snap: Snapshot): Model {
   return modifyFields(model, {
     nodes: () => snap.nodes,
     edges: () => snap.edges,
+    groups: () => snap.groups,
     outputNodeId: () => snap.outputNodeId,
     nextNode: () => snap.nextNode,
     nextEdge: () => snap.nextEdge,
+    nextGroup: () => snap.nextGroup,
     selectedNodeIds: () => [],
     selectedEdgeId: () => Option.none(),
     hoveredEdgeId: () => Option.none(),
+    selectedGroupId: () => Option.none(),
     pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
     suppressClick: () => false,
   })

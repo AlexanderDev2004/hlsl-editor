@@ -11,6 +11,7 @@ import {
   isNodeType,
 } from '@hlsl-editor/shader-nodes'
 
+import { GROUP_COLORS, GROUP_HEADER, GROUP_PAD, groupBounds } from './groups'
 import {
   BASE_H,
   BASE_W,
@@ -30,7 +31,7 @@ import {
   minimapTransform,
   sceneBounds,
 } from './minimap'
-import { type EditorNode, type Model, toDomainGraph } from './model'
+import { type EditorNode, type Group, type Model, toDomainGraph } from './model'
 import {
   LOADING_VARIANTS,
   type LoadingVariant,
@@ -356,6 +357,26 @@ function headerView(
         ],
         ['Delete'],
       ),
+      h.button(
+        [
+          h.OnClick(Message.PressedGroupSelection()),
+          h.Class(
+            'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-3 py-1',
+          ),
+          h.Title('Group selected nodes (Ctrl/Cmd+G)'),
+        ],
+        ['Group'],
+      ),
+      h.button(
+        [
+          h.OnClick(Message.PressedUngroupSelection()),
+          h.Class(
+            'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-3 py-1',
+          ),
+          h.Title('Ungroup selected group (Ctrl/Cmd+Shift+G)'),
+        ],
+        ['Ungroup'],
+      ),
       h.span(
         [h.Class('ml-auto text-neutral-500')],
         [`${model.nodes.length} nodes · ${model.edges.length} edges`],
@@ -590,6 +611,76 @@ function canvasView(
                 h.Class('marquee'),
               ])
             : h.empty,
+          ...model.groups.flatMap(group => {
+            const rect = groupBounds(group, model.nodes)
+            if (rect === null) {
+              return []
+            }
+            const selected =
+              Option.getOrNull(model.selectedGroupId) === group.id
+            return [
+              h.g(
+                [h.Class('graph-group')],
+                [
+                  h.rect([
+                    h.X(String(rect.x)),
+                    h.Y(String(rect.y)),
+                    h.Width(String(rect.width)),
+                    h.Height(String(rect.height)),
+                    h.Rx('10'),
+                    h.Fill(group.color),
+                    h.FillOpacity('0.08'),
+                    h.Stroke(group.color),
+                    h.StrokeWidth(selected ? '2.5' : '1.5'),
+                    h.Cursor('pointer'),
+                    h.OnClick(Message.SelectedGroup({ groupId: group.id })),
+                  ]),
+                  h.rect([
+                    h.X(String(rect.x)),
+                    h.Y(String(rect.y)),
+                    h.Width(String(rect.width)),
+                    h.Height(String(GROUP_HEADER)),
+                    h.Rx('10'),
+                    h.Fill(group.color),
+                    h.FillOpacity('0.22'),
+                    h.PointerEvents('none'),
+                  ]),
+                  h.text(
+                    [
+                      h.X(String(rect.x + GROUP_PAD / 2)),
+                      h.Y(String(rect.y + 15)),
+                      h.Fill('#f0f6fc'),
+                      h.FontSize('12'),
+                      h.FontWeight('600'),
+                      h.PointerEvents('none'),
+                    ],
+                    [group.name],
+                  ),
+                  h.rect([
+                    h.X(String(rect.x)),
+                    h.Y(String(rect.y)),
+                    h.Width(String(rect.width)),
+                    h.Height(String(GROUP_HEADER)),
+                    h.Fill('transparent'),
+                    h.Cursor('move'),
+                    h.Class('graph-group-header'),
+                    h.OnClick(Message.SelectedGroup({ groupId: group.id })),
+                    h.OnPointerDown((_t, button, sx, sy) =>
+                      button === 0
+                        ? Option.some(
+                            Message.StartedGroupDrag({
+                              groupId: group.id,
+                              x: sx,
+                              y: sy,
+                            }),
+                          )
+                        : Option.none(),
+                    ),
+                  ]),
+                ],
+              ),
+            ]
+          }),
           ...model.edges.flatMap(edge => {
             const from = model.nodes.find(n => n.id === edge.sourceNodeId)
             const to = model.nodes.find(n => n.id === edge.targetNodeId)
@@ -966,6 +1057,12 @@ function inspectorView(
   model: Model,
   h: HtmlBuilder<Message>,
 ): ReturnType<HtmlBuilder<Message>['div']> {
+  const selectedGroup = model.groups.find(
+    group => group.id === Option.getOrNull(model.selectedGroupId),
+  )
+  if (selectedGroup !== undefined) {
+    return groupInspector(h, selectedGroup)
+  }
   const selected = model.nodes.find(n => n.id === model.selectedNodeIds[0])
   return h.div(
     [h.Class('border-b border-neutral-800 p-3 max-h-64 overflow-auto')],
@@ -977,6 +1074,82 @@ function inspectorView(
             ['Select a node to edit its values.'],
           )
         : inspectorFor(h, selected),
+    ],
+  )
+}
+
+function groupInspector(
+  h: HtmlBuilder<Message>,
+  group: Group,
+): ReturnType<HtmlBuilder<Message>['div']> {
+  return h.div(
+    [h.Class('border-b border-neutral-800 p-3 max-h-64 overflow-auto')],
+    [
+      h.div([h.Class('font-semibold text-neutral-100 mb-2')], ['Group']),
+      h.div(
+        [h.Class('flex flex-col gap-3')],
+        [
+          h.label(
+            [h.Class('flex items-center gap-2')],
+            [
+              h.span([h.Class('w-12 text-neutral-400')], ['Name']),
+              h.input([
+                h.Type('text'),
+                h.Value(group.name),
+                h.OnInput(name =>
+                  Message.RenamedGroup({ groupId: group.id, name }),
+                ),
+                h.Class(
+                  'w-full bg-neutral-800 border border-neutral-700 rounded px-2 py-1 text-neutral-100',
+                ),
+                h.AriaLabel('Group name'),
+              ]),
+            ],
+          ),
+          h.div(
+            [h.Class('flex items-center gap-2')],
+            [
+              h.span([h.Class('w-12 text-neutral-400')], ['Color']),
+              h.div(
+                [h.Class('flex flex-wrap gap-1')],
+                GROUP_COLORS.map(color =>
+                  h.button(
+                    [
+                      h.OnClick(
+                        Message.ChangedGroupColor({ groupId: group.id, color }),
+                      ),
+                      h.Class(
+                        color === group.color
+                          ? 'w-5 h-5 rounded border-2 border-white'
+                          : 'w-5 h-5 rounded border border-neutral-600',
+                      ),
+                      h.Style({ backgroundColor: color }),
+                      h.AriaLabel(`Set group color ${color}`),
+                    ],
+                    [' '],
+                  ),
+                ),
+              ),
+            ],
+          ),
+          h.div(
+            [h.Class('text-neutral-500 text-xs')],
+            [
+              `${group.nodeIds.length} node${group.nodeIds.length === 1 ? '' : 's'}`,
+            ],
+          ),
+          h.button(
+            [
+              h.OnClick(Message.PressedUngroupSelection()),
+              h.Class(
+                'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-3 py-1',
+              ),
+              h.AriaLabel('Ungroup group'),
+            ],
+            ['Ungroup'],
+          ),
+        ],
+      ),
     ],
   )
 }
@@ -1155,7 +1328,7 @@ function statusView(
       h.span(
         [h.Class('ml-auto shrink-0')],
         [
-          'Del delete · Ctrl+C/V copy · Ctrl+Z undo · right-click canvas to add',
+          'Del delete · Ctrl+G group · Ctrl+C/V copy · right-click canvas to add',
         ],
       ),
     ],

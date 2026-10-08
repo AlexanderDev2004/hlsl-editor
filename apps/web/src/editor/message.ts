@@ -17,6 +17,11 @@ export const Message = defineMessageUnion({
     y: Schema.Number,
   },
   StartedPan: { x: Schema.Number, y: Schema.Number },
+  StartedGroupDrag: {
+    groupId: Schema.String,
+    x: Schema.Number,
+    y: Schema.Number,
+  },
   StartedMarquee: {
     worldX: Schema.Number,
     worldY: Schema.Number,
@@ -43,6 +48,11 @@ export const Message = defineMessageUnion({
   SelectedContextMenuNode: { nodeType: Schema.String },
   DismissedContextMenu: {},
   PreventedNativeContextMenu: {},
+  SelectedGroup: { groupId: Schema.String },
+  PressedGroupSelection: {},
+  PressedUngroupSelection: {},
+  RenamedGroup: { groupId: Schema.String, name: Schema.String },
+  ChangedGroupColor: { groupId: Schema.String, color: Schema.String },
   ToggledMinimap: {},
   UpdatedParam: {
     nodeId: Schema.String,

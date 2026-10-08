@@ -502,4 +502,166 @@ describe('editor update', () => {
       }),
     )
   })
+
+  test('grouping selected nodes wraps them and selects the group', () => {
+    story(
+      update,
+      given({ ...seedModel(), selectedNodeIds: ['n1', 'n2'] }),
+      message(Message.PressedGroupSelection()),
+      model((m: Model) => {
+        expect(m.groups).toHaveLength(1)
+        expect(m.groups[0]?.nodeIds).toEqual(['n1', 'n2'])
+        expect(Option.getOrNull(m.selectedGroupId)).toBe('g1')
+        expect(m.selectedNodeIds).toEqual([])
+        expect(m.nextGroup).toBe(2)
+        expect(m.status).toContain('Grouped 2 nodes')
+      }),
+      message(Message.PressedUngroupSelection()),
+      model((m: Model) => {
+        expect(m.groups).toHaveLength(0)
+        expect(Option.isNone(m.selectedGroupId)).toBe(true)
+      }),
+    )
+  })
+
+  test('grouping with nothing selected reports it', () => {
+    story(
+      update,
+      given(seedModel()),
+      message(Message.PressedGroupSelection()),
+      model((m: Model) => {
+        expect(m.groups).toHaveLength(0)
+        expect(m.status).toContain('Select nodes to group')
+      }),
+    )
+  })
+
+  test('grouping reassigns a node that already belonged to a group', () => {
+    story(
+      update,
+      given({
+        ...seedModel(),
+        selectedNodeIds: ['n2'],
+        groups: [
+          {
+            id: 'g1',
+            name: 'Old',
+            color: '#58a6ff',
+            nodeIds: ['n1', 'n2'],
+          },
+        ],
+        nextGroup: 2,
+      }),
+      message(Message.PressedGroupSelection()),
+      model((m: Model) => {
+        expect(m.groups).toHaveLength(2)
+        expect(m.groups.find(g => g.id === 'g1')?.nodeIds).toEqual(['n1'])
+        expect(m.groups.find(g => g.id === 'g2')?.nodeIds).toEqual(['n2'])
+      }),
+    )
+  })
+
+  test('renaming and recoloring a group', () => {
+    story(
+      update,
+      given({
+        ...seedModel(),
+        groups: [
+          { id: 'g1', name: 'Group 1', color: '#58a6ff', nodeIds: ['n1'] },
+        ],
+        nextGroup: 2,
+      }),
+      message(Message.RenamedGroup({ groupId: 'g1', name: 'Inputs' })),
+      model((m: Model) => {
+        expect(m.groups[0]?.name).toBe('Inputs')
+      }),
+      message(Message.ChangedGroupColor({ groupId: 'g1', color: '#3fb950' })),
+      model((m: Model) => {
+        expect(m.groups[0]?.color).toBe('#3fb950')
+      }),
+      message(Message.ChangedGroupColor({ groupId: 'g1', color: '#123456' })),
+      model((m: Model) => {
+        expect(m.groups[0]?.color).toBe('#3fb950')
+      }),
+    )
+  })
+
+  test('deleting a node prunes it from its group', () => {
+    story(
+      update,
+      given({
+        ...seedModel(),
+        selectedNodeIds: ['n1'],
+        groups: [
+          { id: 'g1', name: 'Pair', color: '#58a6ff', nodeIds: ['n1', 'n2'] },
+        ],
+      }),
+      message(Message.PressedDelete()),
+      model((m: Model) => {
+        expect(m.groups[0]?.nodeIds).toEqual(['n2'])
+      }),
+    )
+  })
+
+  test('deleting the last member drops its group', () => {
+    story(
+      update,
+      given({
+        ...seedModel(),
+        selectedNodeIds: ['n1'],
+        groups: [{ id: 'g1', name: 'Solo', color: '#58a6ff', nodeIds: ['n1'] }],
+      }),
+      message(Message.PressedDelete()),
+      model((m: Model) => {
+        expect(m.groups).toHaveLength(0)
+      }),
+    )
+  })
+
+  test('deleting a selected group removes the frame but keeps its nodes', () => {
+    story(
+      update,
+      given({
+        ...seedModel(),
+        groups: [
+          { id: 'g1', name: 'Pair', color: '#58a6ff', nodeIds: ['n1', 'n2'] },
+        ],
+        selectedGroupId: Option.some('g1'),
+      }),
+      message(Message.PressedDelete()),
+      model((m: Model) => {
+        expect(m.groups).toHaveLength(0)
+        expect(m.nodes).toHaveLength(4)
+        expect(m.status).toContain('Deleted g1')
+      }),
+    )
+  })
+
+  test('dragging a group header moves all of its member nodes', () => {
+    story(
+      update,
+      given({
+        ...seedModel(),
+        groups: [
+          { id: 'g1', name: 'Pair', color: '#58a6ff', nodeIds: ['n1', 'n2'] },
+        ],
+      }),
+      message(Message.StartedGroupDrag({ groupId: 'g1', x: 0, y: 0 })),
+      model((m: Model) => {
+        expect(Option.getOrNull(m.selectedGroupId)).toBe('g1')
+      }),
+      message(Message.MovedPointer({ x: 100, y: 50 })),
+      model((m: Model) => {
+        expect(m.nodes.find(n => n.id === 'n1')?.position.x).toBe(180)
+        expect(m.nodes.find(n => n.id === 'n1')?.position.y).toBe(170)
+        expect(m.nodes.find(n => n.id === 'n2')?.position.y).toBe(350)
+        expect(m.nodes.find(n => n.id === 'n3')?.position.x).toBe(380)
+      }),
+      message(Message.EndedDrag()),
+      model((m: Model) => {
+        expect(m.past).toHaveLength(1)
+        expect(m.status).toContain('Moved g1')
+      }),
+    )
+  })
 })

@@ -152,6 +152,20 @@ describe('editor view', () => {
     )
   })
 
+  test('grouping a selected node draws a frame and opens the group inspector', () => {
+    scene(
+      { update, view },
+      given(seedModel()),
+      type(role('textbox', { name: 'Search nodes' }), 'mult'),
+      click(text('Multiply')),
+      click(role('button', { name: 'Group' })),
+      expect(selector('.graph-group')).toExist(),
+      expect(role('textbox', { name: 'Group name' })).toExist(),
+      click(role('button', { name: 'Ungroup group' })),
+      expect(selector('.graph-group')).toBeAbsent(),
+    )
+  })
+
   test('invalid graph shows an error state instead of code', () => {
     scene(
       { update, view },
