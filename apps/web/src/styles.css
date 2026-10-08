@@ -1,0 +1,25 @@
+@import 'tailwindcss';
+
+/* Node status indicator: a travelling dashed border for the `border`
+   loading variant, and a rotating arc for the `overlay` spinner. */
+@keyframes node-status-dash {
+  to {
+    stroke-dashoffset: -64;
+  }
+}
+
+@keyframes node-status-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.node-status-border {
+  animation: node-status-dash 1.1s linear infinite;
+}
+
+.node-status-spinner {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: node-status-spin 0.9s linear infinite;
+}

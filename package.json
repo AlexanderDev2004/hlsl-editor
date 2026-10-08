@@ -1,0 +1,25 @@
+{
+  "name": "hlsl-editor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --filter web dev",
+    "build": "pnpm --filter web build",
+    "preview": "pnpm --filter web preview",
+    "test": "pnpm -r test",
+    "lint": "pnpm -r lint",
+    "format": "oxfmt",
+    "typecheck": "pnpm -r typecheck",
+    "deploy": "alchemy deploy infra/alchemy.ts",
+    "dev:infra": "alchemy dev infra/alchemy.ts"
+  },
+  "devDependencies": {
+    "alchemy": "2.0.0-beta.81",
+    "effect": "4.0.1",
+    "oxfmt": "^0.66.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.2"
+  },
+  "packageManager": "pnpm@12.10.1"
+}

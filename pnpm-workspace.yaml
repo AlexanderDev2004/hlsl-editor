@@ -1,0 +1,7 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+allowBuilds:
+  msgpackr-extract: false
+  workerd: false
