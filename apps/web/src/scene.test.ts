@@ -197,6 +197,87 @@ describe('editor view', () => {
     )
   })
 
+  test('the group custom color picker renders wheel, fields, and actions', () => {
+    scene(
+      { update, view },
+      given({
+        ...seedModel(),
+        groups: [
+          { id: 'g1', name: 'Group 1', color: '#58a6ff', nodeIds: ['n1'] },
+        ],
+        nextGroup: 2,
+        colorPicker: Option.some({
+          groupId: 'g1',
+          originalColor: '#58a6ff',
+          draft: '#ff8800',
+        }),
+      }),
+      expect(text('Custom color')).toExist(),
+      expect(role('textbox', { name: 'Color hex' })).toExist(),
+      expect(role('spinbutton', { name: 'Color R' })).toExist(),
+      expect(role('button', { name: 'Apply custom color' })).toExist(),
+      click(role('button', { name: 'Cancel custom color' })),
+      expect(text('Custom color')).toBeAbsent(),
+    )
+  })
+
+  test('Play previews the evaluated color and closes', () => {
+    scene(
+      { update, view },
+      given(seedModel()),
+      click(role('button', { name: 'Play' })),
+      expect(text('▶ Play preview')).toExist(),
+      expect(selector('.play-checker')).toExist(),
+      // Seed graph: Float(2) * Float(5) = 10, splatted to float4.
+      expect(text('10.0000')).toExist(),
+      click(role('button', { name: 'Close play preview' })),
+      expect(selector('.play-checker')).toBeAbsent(),
+    )
+  })
+
+  test('Play on a broken graph shows guidance instead of a preview', () => {
+    scene(
+      { update, view },
+      given({
+        ...seedModel(),
+        nodes: [],
+        edges: [],
+        outputNodeId: Option.none(),
+      }),
+      click(role('button', { name: 'Play' })),
+      expect(text('Cannot play: fix 1 problem first.')).toExist(),
+      expect(selector('.play-checker')).toBeAbsent(),
+    )
+  })
+
+  test('the log panel lists entries, clears, and hides', () => {
+    scene(
+      { update, view },
+      given({
+        ...seedModel(),
+        logs: [
+          {
+            id: 2,
+            level: 'error',
+            text: 'Type mismatch: Expected float, Received float3.',
+          },
+          { id: 1, level: 'system', text: 'Session console ready.' },
+        ],
+        nextLogId: 3,
+      }),
+      expect(selector('.log-panel')).toExist(),
+      expect(text('Type mismatch: Expected float, Received float3.')).toExist(),
+      expect(text('Session console ready.')).toExist(),
+      expect(text('1 error')).toExist(),
+      click(role('button', { name: 'Clear log panel' })),
+      expect(text('No entries yet. Connect nodes or edit the graph.')).toExist(),
+      click(role('button', { name: 'Close log panel' })),
+      expect(selector('.log-panel')).toBeAbsent(),
+      click(role('button', { name: 'Toggle log panel' })),
+      expect(selector('.log-panel')).toExist(),
+    )
+  })
+
   test('double-clicking a wire inserts a reroute and opens its inspector', () => {
     scene(
       { update, view },

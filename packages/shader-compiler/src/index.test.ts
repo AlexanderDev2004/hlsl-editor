@@ -2,7 +2,7 @@ import { addEdge, addNode, createGraph } from "@hlsl-editor/graph";
 import { createNodeOfType } from "@hlsl-editor/shader-nodes";
 import { describe, expect, test } from "vitest";
 
-import { generate, toIR, validate } from "./index";
+import { evaluateGraph, generate, toIR, validate } from "./index";
 
 function floatNode(id: string, value: number, x = 0) {
   return createNodeOfType("Float", id, { x, y: 0 }, { value });
@@ -327,5 +327,105 @@ describe("hlsl generation", () => {
       expect(res.code).toContain("float4 _1 = float4(_0, _0, _0, _0);");
       expect(res.code).not.toContain("_2");
     }
+  });
+
+  test("emitted shader is a complete pixel shader entry point", () => {
+    let g = createGraph();
+    g = addNode(g, floatNode("a", 2));
+    g = addNode(g, outputNode("out"));
+    g = addEdge(g, {
+      id: "e1",
+      source: { nodeId: "a", port: "out" },
+      target: { nodeId: "out", port: "color" },
+    });
+    const res = generate(g);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      // Pixel shader entry point per HLSL docs: SV_Target marks the render
+      // target output; `main` is the default entry point for fxc/dxc.
+      expect(res.code).toMatch(/^float4 main\(\) : SV_Target\n\{\n/);
+      expect(res.code).toContain("    return _1;\n}");
+      expect(res.code.endsWith("}\n")).toBe(true);
+    }
+  });
+});
+
+describe("evaluation", () => {
+  test("Float(2) * Float(5) evaluates to splat 10", () => {
+    let g = createGraph();
+    g = addNode(g, floatNode("a", 2));
+    g = addNode(g, floatNode("b", 5));
+    g = addNode(g, createNodeOfType("Multiply", "mul", { x: 100, y: 0 }, {}));
+    g = addNode(g, outputNode("out"));
+    g = addEdge(g, {
+      id: "e1",
+      source: { nodeId: "a", port: "out" },
+      target: { nodeId: "mul", port: "a" },
+    });
+    g = addEdge(g, {
+      id: "e2",
+      source: { nodeId: "b", port: "out" },
+      target: { nodeId: "mul", port: "b" },
+    });
+    g = addEdge(g, {
+      id: "e3",
+      source: { nodeId: "mul", port: "out" },
+      target: { nodeId: "out", port: "color" },
+    });
+    const res = evaluateGraph(g);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.color).toEqual([10, 10, 10, 10]);
+    }
+  });
+
+  test("Float output splats alpha like the emitter", () => {
+    let g = createGraph();
+    g = addNode(g, floatNode("a", 0.5));
+    g = addNode(g, outputNode("out"));
+    g = addEdge(g, {
+      id: "e1",
+      source: { nodeId: "a", port: "out" },
+      target: { nodeId: "out", port: "color" },
+    });
+    const res = evaluateGraph(g);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.color).toEqual([0.5, 0.5, 0.5, 0.5]);
+    }
+  });
+
+  test("division by zero yields IEEE infinity", () => {
+    let g = createGraph();
+    g = addNode(g, floatNode("a", 1));
+    g = addNode(g, floatNode("b", 0));
+    g = addNode(g, createNodeOfType("Divide", "div", { x: 100, y: 0 }, {}));
+    g = addNode(g, outputNode("out"));
+    g = addEdge(g, {
+      id: "e1",
+      source: { nodeId: "a", port: "out" },
+      target: { nodeId: "div", port: "a" },
+    });
+    g = addEdge(g, {
+      id: "e2",
+      source: { nodeId: "b", port: "out" },
+      target: { nodeId: "div", port: "b" },
+    });
+    g = addEdge(g, {
+      id: "e3",
+      source: { nodeId: "div", port: "out" },
+      target: { nodeId: "out", port: "color" },
+    });
+    const res = evaluateGraph(g);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.color[0]).toBe(Number.POSITIVE_INFINITY);
+    }
+  });
+
+  test("invalid graph produces no value", () => {
+    const g = addNode(createGraph(), floatNode("a", 1));
+    const res = evaluateGraph(g);
+    expect(res.ok).toBe(false);
   });
 });

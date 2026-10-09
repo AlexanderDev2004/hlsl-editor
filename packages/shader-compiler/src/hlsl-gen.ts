@@ -158,5 +158,10 @@ export function emitHLSL(ir: GraphIR): string {
     throw new Error("IR has no output node");
   }
   lines.push(`float4 ${ir.outputVar} = ${exprFor(ir, out)};`);
-  return lines.join("\n") + "\n";
+  lines.push(`return ${ir.outputVar};`);
+  // A pixel shader needs an entry point whose return carries the SV_Target
+  // semantic (the render target output). `main` is the default entry-point
+  // name for fxc and dxc, so the file compiles without extra flags.
+  const body = lines.map((line) => `    ${line}`);
+  return ["float4 main() : SV_Target", "{", ...body, "}", ""].join("\n");
 }

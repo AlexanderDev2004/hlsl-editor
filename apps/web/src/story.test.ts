@@ -2,6 +2,8 @@ import { Option } from 'effect'
 import { Command, given, message, model, story } from 'foldkit/story'
 import { describe, expect, test } from 'vitest'
 
+import { validate } from '@hlsl-editor/shader-compiler'
+
 import { PersistSettings } from './editor/commands'
 import {
   Message,
@@ -9,6 +11,7 @@ import {
   deriveNodeStatuses,
   emptyModel,
   seedModel,
+  toDomainGraph,
   update,
 } from './main'
 
@@ -34,6 +37,180 @@ describe('editor update', () => {
       message(Message.RequestedAddNode({ x: 0, y: 0 })),
       model((m: Model) => {
         expect(m.nodes).toHaveLength(4)
+      }),
+    )
+  })
+
+  test('RequestedNew starts a valid graph with one Fragment Output', () => {
+    story(
+      update,
+      given(emptyModel()),
+      message(Message.RequestedNew()),
+      Command.expectNone(),
+      model((m: Model) => {
+        expect(m.nodes).toHaveLength(1)
+        expect(m.nodes[0]?.type).toBe('FragmentOutput')
+        expect(Option.getOrNull(m.outputNodeId)).toBe('n1')
+        expect(m.nextNode).toBe(2)
+        // The unconnected color port is the only expected problem; the
+        // output node itself is present, so MissingOutput is gone.
+        expect(validate(toDomainGraph(m)).map(e => e.code)).toEqual([
+          'MissingRequiredInput',
+        ])
+      }),
+    )
+  })
+
+  test('RequestedPlay previews the evaluated output color', () => {
+    story(
+      update,
+      given(seedModel()),
+      message(Message.RequestedPlay()),
+      Command.expectNone(),
+      model((m: Model) => {
+        // Seed graph: Float(2) * Float(5) -> color, splatted to float4.
+        expect(Option.getOrNull(m.play)).toEqual({ color: [10, 10, 10, 10] })
+        expect(m.status).toContain('Playing preview')
+      }),
+    )
+  })
+
+  test('RequestedPlay refuses a graph with problems', () => {
+    story(
+      update,
+      given(emptyModel()),
+      message(Message.RequestedPlay()),
+      Command.expectNone(),
+      model((m: Model) => {
+        expect(Option.isNone(m.play)).toBe(true)
+        expect(m.status).toContain('Cannot play: fix 1 problem first.')
+      }),
+    )
+  })
+
+  test('DismissedPlay closes the preview', () => {
+    story(
+      update,
+      given(seedModel()),
+      message(Message.RequestedPlay()),
+      message(Message.DismissedPlay()),
+      Command.expectNone(),
+      model((m: Model) => {
+        expect(Option.isNone(m.play)).toBe(true)
+      }),
+    )
+  })
+
+  test('editing a param closes the stale Play preview', () => {
+    story(
+      update,
+      given(seedModel()),
+      message(Message.RequestedPlay()),
+      message(
+        Message.UpdatedParam({ nodeId: 'n1', key: 'value', valueText: '3' }),
+      ),
+      Command.expectNone(),
+      model((m: Model) => {
+        expect(Option.isNone(m.play)).toBe(true)
+      }),
+    )
+  })
+
+  test('imported params are sanitized against the node registry', () => {
+    // JSON.parse turns 1e999 into Infinity, which decodeParams accepts;
+    // sanitizeParams must replace it with the default and drop unknown keys.
+    const text =
+      '{"version":1,"nodes":[' +
+      '{"id":"n1","type":"Float","position":{"x":0,"y":0},"params":{"value":1e999,"bogus":7}},' +
+      '{"id":"n2","type":"FragmentOutput","position":{"x":10,"y":0},"params":{}}],' +
+      '"edges":[{"id":"e1","source":{"nodeId":"n1","port":"out"},"target":{"nodeId":"n2","port":"color"}}],' +
+      '"outputNodeId":"n2"}'
+    story(
+      update,
+      given(emptyModel()),
+      message(Message.CompletedImportFile({ text })),
+      Command.expectNone(),
+      model((m: Model) => {
+        expect(m.nodes[0]?.params).toEqual({ value: 0 })
+      }),
+    )
+  })
+
+  test('a rejected connection logs an error entry', () => {
+    story(
+      update,
+      given(emptyModel()),
+      message(Message.ChangedNewNodeType({ nodeType: 'Float3' })),
+      message(Message.RequestedAddNode({ x: 0, y: 0 })),
+      message(Message.ChangedNewNodeType({ nodeType: 'Combine' })),
+      message(Message.RequestedAddNode({ x: 400, y: 0 })),
+      message(Message.ClickedPort({ nodeId: 'n1', port: 'out' })),
+      message(Message.ClickedPort({ nodeId: 'n2', port: 'x' })),
+      Command.expectNone(),
+      model((m: Model) => {
+        // Combine.x takes scalars only; float3 cannot feed it. Entries 1-2
+        // are the two "Added ..." infos from setting the scene up.
+        expect(m.logs[0]?.level).toBe('error')
+        expect(m.logs[0]?.text).toContain('Type mismatch')
+        expect(m.logs[0]?.id).toBe(3)
+        expect(m.nextLogId).toBe(4)
+      }),
+    )
+  })
+
+  test('a successful connection logs a success entry', () => {
+    story(
+      update,
+      given(emptyModel()),
+      message(Message.RequestedAddNode({ x: 0, y: 0 })),
+      message(Message.ChangedNewNodeType({ nodeType: 'FragmentOutput' })),
+      message(Message.RequestedAddNode({ x: 400, y: 0 })),
+      message(Message.ClickedPort({ nodeId: 'n1', port: 'out' })),
+      message(Message.ClickedPort({ nodeId: 'n2', port: 'color' })),
+      Command.expectNone(),
+      model((m: Model) => {
+        expect(m.logs[0]?.level).toBe('success')
+        expect(m.logs[0]?.text).toBe('Connected n1.out to n2.color.')
+      }),
+    )
+  })
+
+  test('an invalid param value logs a warning entry', () => {
+    story(
+      update,
+      given(seedModel()),
+      message(Message.UpdatedParam({ nodeId: 'n1', key: 'value', valueText: 'abc' })),
+      Command.expectNone(),
+      model((m: Model) => {
+        expect(m.logs[0]?.level).toBe('warning')
+        expect(m.logs[0]?.text).toContain('Invalid number: "abc"')
+      }),
+    )
+  })
+
+  test('PressedClearLogs empties the console but keeps the id counter', () => {
+    story(
+      update,
+      given(seedModel()),
+      message(Message.RequestedPlay()),
+      message(Message.PressedClearLogs()),
+      Command.expectNone(),
+      model((m: Model) => {
+        expect(m.logs).toEqual([])
+        expect(m.nextLogId).toBeGreaterThan(1)
+      }),
+    )
+  })
+
+  test('ToggledLogPanel flips the panel visibility flag', () => {
+    story(
+      update,
+      given({ ...seedModel(), logPanelOpen: false }),
+      message(Message.ToggledLogPanel()),
+      message(Message.ToggledLogPanel()),
+      Command.expectNone(),
+      model((m: Model) => {
+        expect(m.logPanelOpen).toBe(false)
       }),
     )
   })
@@ -288,8 +465,8 @@ describe('editor update', () => {
         expect(m.edges).toHaveLength(4)
         expect([...m.selectedNodeIds].sort()).toEqual(['n5', 'n6'])
         const pastedNode = m.nodes.find(n => n.id === 'n5')
-        expect(pastedNode?.position.x).toBe(120)
-        expect(pastedNode?.position.y).toBe(160)
+        expect(pastedNode?.position.x).toBe(460)
+        expect(pastedNode?.position.y).toBe(420)
         const pastedEdge = m.edges.find(e => e.id === 'e4')
         expect(pastedEdge?.sourceNodeId).toBe('n5')
         expect(pastedEdge?.targetNodeId).toBe('n6')
@@ -309,8 +486,8 @@ describe('editor update', () => {
       model((m: Model) => {
         const first = m.nodes.find(n => n.id === 'n5')
         const second = m.nodes.find(n => n.id === 'n6')
-        expect(first?.position.x).toBe(120)
-        expect(second?.position.x).toBe(160)
+        expect(first?.position.x).toBe(460)
+        expect(second?.position.x).toBe(500)
       }),
     )
   })
@@ -352,7 +529,7 @@ describe('editor update', () => {
           screenY: 0,
         }),
       ),
-      message(Message.MovedPointer({ x: 600, y: 400 })),
+      message(Message.MovedPointer({ x: 960, y: 700 })),
       message(Message.EndedDrag()),
       model((m: Model) => {
         expect([...m.selectedNodeIds].sort()).toEqual(['n1', 'n2', 'n3'])
@@ -562,7 +739,7 @@ describe('editor update', () => {
     )
   })
 
-  test('renaming and recoloring a group', () => {
+  test('renaming a group and recoloring it with any valid hex', () => {
     story(
       update,
       given({
@@ -582,7 +759,104 @@ describe('editor update', () => {
       }),
       message(Message.ChangedGroupColor({ groupId: 'g1', color: '#123456' })),
       model((m: Model) => {
-        expect(m.groups[0]?.color).toBe('#3fb950')
+        expect(m.groups[0]?.color).toBe('#123456')
+      }),
+      message(Message.ChangedGroupColor({ groupId: 'g1', color: 'nothex' })),
+      model((m: Model) => {
+        expect(m.groups[0]?.color).toBe('#123456')
+      }),
+    )
+  })
+
+  test('the custom group color picker drafts, applies, and closes', () => {
+    story(
+      update,
+      given({
+        ...seedModel(),
+        groups: [
+          { id: 'g1', name: 'Group 1', color: '#58a6ff', nodeIds: ['n1'] },
+        ],
+        nextGroup: 2,
+      }),
+      message(Message.OpenedGroupColorPicker({ groupId: 'g1' })),
+      model((m: Model) => {
+        const picker = Option.getOrNull(m.colorPicker)
+        expect(picker?.groupId).toBe('g1')
+        expect(picker?.draft).toBe('#58a6ff')
+        expect(picker?.originalColor).toBe('#58a6ff')
+      }),
+      message(Message.EditedGroupColorDraft({ text: '#ff8800' })),
+      model((m: Model) => {
+        expect(Option.getOrNull(m.colorPicker)?.draft).toBe('#ff8800')
+        expect(m.groups[0]?.color).toBe('#58a6ff')
+      }),
+      message(Message.AppliedGroupColorDraft()),
+      model((m: Model) => {
+        expect(m.groups[0]?.color).toBe('#ff8800')
+        expect(Option.isNone(m.colorPicker)).toBe(true)
+      }),
+    )
+  })
+
+  test('applying an invalid group color draft keeps the picker open', () => {
+    story(
+      update,
+      given({
+        ...seedModel(),
+        groups: [
+          { id: 'g1', name: 'Group 1', color: '#58a6ff', nodeIds: ['n1'] },
+        ],
+        nextGroup: 2,
+        colorPicker: Option.some({
+          groupId: 'g1',
+          originalColor: '#58a6ff',
+          draft: 'nothex',
+        }),
+      }),
+      message(Message.AppliedGroupColorDraft()),
+      model((m: Model) => {
+        expect(m.groups[0]?.color).toBe('#58a6ff')
+        expect(Option.isSome(m.colorPicker)).toBe(true)
+      }),
+    )
+  })
+
+  test('cancelling or escaping the group color picker keeps the color', () => {
+    story(
+      update,
+      given({
+        ...seedModel(),
+        groups: [
+          { id: 'g1', name: 'Group 1', color: '#58a6ff', nodeIds: ['n1'] },
+        ],
+        nextGroup: 2,
+        colorPicker: Option.some({
+          groupId: 'g1',
+          originalColor: '#58a6ff',
+          draft: '#ff8800',
+        }),
+      }),
+      message(Message.PressedEscape()),
+      model((m: Model) => {
+        expect(m.groups[0]?.color).toBe('#58a6ff')
+        expect(Option.isNone(m.colorPicker)).toBe(true)
+      }),
+      message(Message.OpenedGroupColorPicker({ groupId: 'g1' })),
+      message(Message.CancelledGroupColorPicker()),
+      model((m: Model) => {
+        expect(m.groups[0]?.color).toBe('#58a6ff')
+        expect(Option.isNone(m.colorPicker)).toBe(true)
+      }),
+    )
+  })
+
+  test('opening the group color picker requires an existing group', () => {
+    story(
+      update,
+      given(seedModel()),
+      message(Message.OpenedGroupColorPicker({ groupId: 'missing' })),
+      model((m: Model) => {
+        expect(Option.isNone(m.colorPicker)).toBe(true)
       }),
     )
   })
@@ -653,10 +927,10 @@ describe('editor update', () => {
       }),
       message(Message.MovedPointer({ x: 100, y: 50 })),
       model((m: Model) => {
-        expect(m.nodes.find(n => n.id === 'n1')?.position.x).toBe(180)
-        expect(m.nodes.find(n => n.id === 'n1')?.position.y).toBe(170)
-        expect(m.nodes.find(n => n.id === 'n2')?.position.y).toBe(350)
-        expect(m.nodes.find(n => n.id === 'n3')?.position.x).toBe(380)
+        expect(m.nodes.find(n => n.id === 'n1')?.position.x).toBe(520)
+        expect(m.nodes.find(n => n.id === 'n1')?.position.y).toBe(430)
+        expect(m.nodes.find(n => n.id === 'n2')?.position.y).toBe(610)
+        expect(m.nodes.find(n => n.id === 'n3')?.position.x).toBe(720)
       }),
       message(Message.EndedDrag()),
       model((m: Model) => {

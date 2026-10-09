@@ -65,6 +65,10 @@ export const Message = defineMessageUnion({
   PressedUngroupSelection: {},
   RenamedGroup: { groupId: Schema.String, name: Schema.String },
   ChangedGroupColor: { groupId: Schema.String, color: Schema.String },
+  OpenedGroupColorPicker: { groupId: Schema.String },
+  EditedGroupColorDraft: { text: Schema.String },
+  AppliedGroupColorDraft: {},
+  CancelledGroupColorPicker: {},
   InsertedRerouteOnEdge: {
     edgeId: Schema.String,
     worldX: Schema.Number,
@@ -143,6 +147,10 @@ export const Message = defineMessageUnion({
   RequestedCopyHlsl: {},
   CompletedCopyHlsl: {},
   FailedCopyHlsl: { reason: Schema.String },
+  RequestedPlay: {},
+  DismissedPlay: {},
+  ToggledLogPanel: {},
+  PressedClearLogs: {},
   DismissedStatus: {},
 })
 export type Message = typeof Message.Type

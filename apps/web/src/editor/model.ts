@@ -5,7 +5,7 @@ import { Option, Schema } from 'effect'
 import { modifyFields } from 'foldkit/struct'
 
 import type { Graph } from '@hlsl-editor/graph'
-import { createNodeOfType, isNodeType } from '@hlsl-editor/shader-nodes'
+import { NODE_REGISTRY, createNodeOfType, isNodeType } from '@hlsl-editor/shader-nodes'
 
 import { DEFAULT_KEYMAP } from './shortcuts'
 
@@ -96,6 +96,40 @@ export const NodeMenu = Schema.Struct({
   clientY: Schema.Number,
 })
 export type NodeMenu = typeof NodeMenu.Type
+
+export const ColorPickerState = Schema.Struct({
+  groupId: Schema.String,
+  originalColor: Schema.String,
+  draft: Schema.String,
+})
+export type ColorPickerState = typeof ColorPickerState.Type
+
+// Snapshot of one Play run: raw RGBA components of the Fragment Output.
+export const PlayState = Schema.Struct({
+  color: Schema.Tuple([
+    Schema.Number,
+    Schema.Number,
+    Schema.Number,
+    Schema.Number,
+  ]),
+})
+export type PlayState = typeof PlayState.Type
+
+// Session console: connection attempts, edits, persistence, and Play are
+// logged here with a level so the user can see what the editor did and why
+// a connection was rejected. Newest first, capped in `withLog`.
+export const LogEntry = Schema.Struct({
+  id: Schema.Number,
+  level: Schema.Union([
+    Schema.Literal('error'),
+    Schema.Literal('warning'),
+    Schema.Literal('success'),
+    Schema.Literal('info'),
+    Schema.Literal('system'),
+  ]),
+  text: Schema.String,
+})
+export type LogEntry = typeof LogEntry.Type
 
 export const DragState = Schema.Union([
   Schema.Struct({ mode: Schema.Literal('idle') }),
@@ -197,6 +231,11 @@ export const Model = Schema.Struct({
   minimapVisible: Schema.Boolean,
   contextMenu: Schema.Option(ContextMenu),
   nodeMenu: Schema.Option(NodeMenu),
+  colorPicker: Schema.Option(ColorPickerState),
+  play: Schema.Option(PlayState),
+  logs: Schema.Array(LogEntry),
+  nextLogId: Schema.Number,
+  logPanelOpen: Schema.Boolean,
   simulateLoading: Schema.Boolean,
   loadingVariant: Schema.Union([
     Schema.Literal('border'),
@@ -230,10 +269,10 @@ function seedNode(
 export function seedModel(): Model {
   return {
     nodes: [
-      seedNode('n1', 'Float', 80, 120, { value: 2 }),
-      seedNode('n2', 'Float', 80, 300, { value: 5 }),
-      seedNode('n3', 'Multiply', 380, 190, {}),
-      seedNode('n4', 'FragmentOutput', 680, 190, {}),
+      seedNode('n1', 'Float', 420, 380, { value: 2 }),
+      seedNode('n2', 'Float', 420, 560, { value: 5 }),
+      seedNode('n3', 'Multiply', 720, 450, {}),
+      seedNode('n4', 'FragmentOutput', 1020, 450, {}),
     ],
     edges: [
       {
@@ -286,6 +325,11 @@ export function seedModel(): Model {
     minimapVisible: true,
     contextMenu: Option.none(),
     nodeMenu: Option.none(),
+    colorPicker: Option.none(),
+    play: Option.none(),
+    logs: [],
+    nextLogId: 1,
+    logPanelOpen: true,
     simulateLoading: false,
     loadingVariant: 'border',
     settingsOpen: false,
@@ -325,7 +369,12 @@ export function takeSnapshot(model: Model): Snapshot {
 export function pushHistory(model: Model): Model {
   const past = [...model.past, takeSnapshot(model)]
   const trimmed = past.length > 100 ? past.slice(past.length - 100) : past
-  return modifyFields(model, { past: () => trimmed, future: () => [] })
+  // Any undoable edit invalidates a running Play preview.
+  return modifyFields(model, {
+    past: () => trimmed,
+    future: () => [],
+    play: () => Option.none(),
+  })
 }
 
 export function restoreSnapshot(model: Model, snap: Snapshot): Model {
@@ -389,6 +438,32 @@ export function toDomainGraph(model: Model): Graph {
   }
 }
 
+// Imports arrive from untrusted JSON, so params are rebuilt from the node
+// registry: only known keys with finite numbers survive, everything else
+// falls back to the type's defaults. Keeps generated HLSL numeric no matter
+// what a hand-edited file contains.
+function sanitizeParams(
+  type: string,
+  params: Record<string, number | Array<number>>,
+): Record<string, number | Array<number>> {
+  if (!isNodeType(type)) {
+    return { ...params }
+  }
+  const clean: Record<string, number | Array<number>> = {
+    ...NODE_REGISTRY[type].defaultParams,
+  }
+  for (const [key, value] of Object.entries(params)) {
+    if (
+      key in NODE_REGISTRY[type].defaultParams &&
+      typeof value === 'number' &&
+      Number.isFinite(value)
+    ) {
+      clean[key] = value
+    }
+  }
+  return clean
+}
+
 export function fromSerialized(data: {
   version: number
   nodes: Array<{
@@ -422,12 +497,7 @@ export function fromSerialized(data: {
 > {
   const nodes: Array<EditorNode> = data.nodes
     .filter(n => isNodeType(n.type))
-    .map(n => ({
-      id: n.id,
-      type: n.type,
-      position: { ...n.position },
-      params: { ...n.params },
-    }))
+    .map(n => ({ id: n.id, type: n.type, position: { ...n.position }, params: sanitizeParams(n.type, n.params) }))
   const edges: Array<EditorEdge> = data.edges.map(e => ({
     id: e.id,
     sourceNodeId: e.source.nodeId,

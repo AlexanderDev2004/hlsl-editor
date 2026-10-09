@@ -136,6 +136,11 @@ Graph Editor (Foldkit SVG canvas)
                       byte-identical output for the same graph)
 ```
 
+The generated file is a complete pixel shader: the body is wrapped in a
+`float4 main() : SV_Target` entry point per the HLSL docs (SV_Target marks
+the render-target output; `main` is the default entry point for fxc/dxc, so
+the file compiles with no extra flags).
+
 Connections are made by clicking an output port then an input port.
 `float -> floatN` inserts a splat constructor; `floatN -> float` is rejected
 (use Split). Invalid graphs produce structured errors and no HLSL.
@@ -177,7 +182,8 @@ work unchanged.
   selects them.
 - Grouping: select nodes and press `Ctrl/Cmd+G` (or the Group button) to wrap
   them in a named, colored comment box. Rename and recolor it in the
-  Inspector, drag its header to move every member, or press
+  Inspector (8 preset swatches, or `Custom…` for a honeycomb picker with
+  hex/RGB fields), drag its header to move every member, or press
   `Ctrl/Cmd+Shift+G` (or Ungroup) to remove the frame. A node belongs to at
   most one group; deleting its last member removes the group.
 - Node status indicator: every node shows a derived status
@@ -205,8 +211,22 @@ work unchanged.
   (history is graph-only, capped at 100).
 - Save to browser storage, load on start, New, Export JSON, Import JSON
   (`{version: 1, nodes, edges, outputNodeId, rerouteNames, collapsed}`).
-- 114 tests: type system, graph, validation, HLSL generation (incl.
-  determinism and unused-node exclusion), Foldkit story/scene tests.
+  Imported params are sanitized against the node registry: unknown keys and
+  non-finite numbers fall back to defaults, so a hand-edited file can never
+  produce non-numeric HLSL.
+- Play: runs the graph numerically and previews the Fragment Output color in
+  a modal — clamped swatch over a checkerboard, raw RGBA readout, hex. Any
+  graph edit closes the preview; Esc or the backdrop closes it too.
+- Log panel: a session console under the canvas. Every connection attempt
+  (success or rejected with its reason), node add/delete, param edit,
+  save/load/import, copy, and Play run is logged with a level — error,
+  warning, success, info, system — newest first, capped at 200 entries.
+  The header shows error/warning counts; Clear empties it and the toolbar
+  Log button (or the panel's ✕) toggles it. Logs are session-only: they are
+  not saved, exported, or undoable.
+- 144 tests: type system, graph, validation, HLSL generation (incl.
+  determinism, entry-point emission, and unused-node exclusion), numeric
+  evaluation, Foldkit story/scene tests.
 
 ## 12. MVP Roadmap
 

@@ -13,6 +13,16 @@ import {
 } from '@hlsl-editor/shader-nodes'
 
 import { collapsedBounds, hiddenNodeIds } from './collapse'
+import {
+  GRAYSCALE,
+  HONEYCOMB,
+  PICKER_H,
+  PICKER_W,
+  hexToRgb,
+  normalizeHexColor,
+  rgbFromChannels,
+  rgbToHex,
+} from './color-picker'
 import { GROUP_COLORS, GROUP_HEADER, GROUP_PAD, groupBounds } from './groups'
 import {
   BASE_H,
@@ -37,8 +47,10 @@ import {
 } from './minimap'
 import {
   type CollapsedNode,
+  type EditorEdge,
   type EditorNode,
   type Group,
+  type LogEntry,
   type Model,
   toDomainGraph,
 } from './model'
@@ -124,6 +136,18 @@ const TYPE_COLORS: Record<string, string> = {
   float4: '#f778ba',
 }
 
+const CATEGORY_COLORS: Record<string, string> = {
+  Input: '#38bdf8',
+  Math: '#34d399',
+  Vector: '#fbbf24',
+  Utility: '#a78bfa',
+  Output: '#fb7185',
+}
+
+function categoryColor(category: string): string {
+  return CATEGORY_COLORS[category] ?? '#8b949e'
+}
+
 // Named reroute declarations/usages are created through the reroute actions,
 // never dropped in standalone (a lone usage has no declaration to link to).
 const PALETTE_TYPES = NODE_TYPES.filter(
@@ -140,16 +164,6 @@ const STATUS_COLORS: Record<NodeStatus, string> = {
   success: '#3fb950',
   warning: '#d29922',
   error: '#f85149',
-}
-
-function statusHeaderFill(status: NodeStatus): string {
-  if (status === 'error') {
-    return '#5a1d1d'
-  }
-  if (status === 'warning') {
-    return '#4a3a12'
-  }
-  return '#21262d'
 }
 
 // A node wrapper that shows one of five states. The node body border takes
@@ -178,7 +192,7 @@ function nodeStatusIndicator(
           h.Width(String(width)),
           h.Height(String(height)),
           h.Rx('8'),
-          h.Fill('#0d1117'),
+          h.Fill('#0a0c10'),
           h.FillOpacity('0.7'),
         ]),
         h.circle([
@@ -214,7 +228,49 @@ function edgePath(x1: number, y1: number, x2: number, y2: number): string {
   return `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`
 }
 
-const HIGHLIGHT_COLOR = '#22d3ee'
+const HIGHLIGHT_COLOR = '#38bdf8'
+
+const NEUTRAL_WIRE = '#5b6572'
+
+// Wires take the colour of the type that flows through them. Reroutes are
+// transparent to the compiler, so the colour resolves through them to the
+// upstream port that actually carries the value.
+function resolvedSourceType(
+  model: Model,
+  edge: EditorEdge,
+  depth?: number,
+): string | null {
+  const level = depth ?? 0
+  if (level > 12) {
+    return null
+  }
+  const source = model.nodes.find(n => n.id === edge.sourceNodeId)
+  if (source === undefined) {
+    return null
+  }
+  if (!isRerouteType(source.type)) {
+    if (!isNodeType(source.type)) {
+      return null
+    }
+    const port = NODE_REGISTRY[source.type].outputs.find(
+      o => o.name === edge.sourcePort,
+    )
+    return port === undefined ? null : port.valueType
+  }
+  const upstream = model.edges.find(
+    e => e.targetNodeId === source.id && e.targetPort === 'in',
+  )
+  return upstream === undefined
+    ? null
+    : resolvedSourceType(model, upstream, level + 1)
+}
+
+function wireColor(model: Model, edge: EditorEdge): string {
+  const valueType = resolvedSourceType(model, edge)
+  return valueType === null
+    ? NEUTRAL_WIRE
+    : (TYPE_COLORS[valueType] ?? NEUTRAL_WIRE)
+}
 
 // An edge lights up when hovered or selected. The nodes it connects light
 // up with it, so the user can read where a wire goes at a glance.
@@ -261,11 +317,7 @@ export const view = (model: Model, h: HtmlBuilder<Message>): Document => {
   return {
     title: `HLSL Editor — ${model.nodes.length} nodes`,
     body: h.div(
-      [
-        h.Class(
-          'h-screen flex flex-col bg-neutral-950 text-neutral-200 text-sm',
-        ),
-      ],
+      [h.Class('h-screen flex flex-col bg-[#0a0c10] text-neutral-200 text-sm')],
       [
         headerView(model, h),
         h.div(
@@ -275,7 +327,7 @@ export const view = (model: Model, h: HtmlBuilder<Message>): Document => {
             h.div(
               [
                 h.Class(
-                  'w-[380px] shrink-0 border-l border-neutral-800 flex flex-col min-h-0 bg-neutral-900',
+                  'w-[380px] shrink-0 border-l border-[#1c2230] flex flex-col min-h-0 bg-[#0e1116]',
                 ),
               ],
               [
@@ -287,10 +339,33 @@ export const view = (model: Model, h: HtmlBuilder<Message>): Document => {
           ],
         ),
         statusView(model, h),
+        logPanelView(model, h),
         settingsView(model, h),
+        colorPickerView(model, h),
+        playPreviewView(model, h),
       ],
     ),
   }
+}
+
+const HEADER_DIVIDER = 'h-5 w-px bg-[#1c2230] shrink-0'
+
+function headerToolButton(
+  h: HtmlBuilder<Message>,
+  label: string,
+  message: Message,
+  title?: string,
+): ReturnType<HtmlBuilder<Message>['button']> {
+  return h.button(
+    [
+      h.OnClick(message),
+      h.Class(
+        'px-2.5 py-1 rounded-md text-[12.5px] text-neutral-300 hover:text-neutral-100 hover:bg-neutral-800/80 border border-transparent transition-colors',
+      ),
+      ...(title === undefined ? [] : [h.Title(title)]),
+    ],
+    [label],
+  )
 }
 
 function headerView(
@@ -300,133 +375,693 @@ function headerView(
   return h.div(
     [
       h.Class(
-        'flex items-center gap-2 px-3 py-2 border-b border-neutral-800 bg-neutral-900',
+        'h-14 shrink-0 flex items-center gap-3 px-4 border-b border-[#1c2230] bg-[#0e1116]',
       ),
     ],
     [
-      h.span([h.Class('font-semibold text-neutral-100 mr-2')], ['HLSL Editor']),
-      searchView(model, h),
-      h.select(
-        [
-          h.OnChange(value => Message.ChangedNewNodeType({ nodeType: value })),
-          h.Value(model.newNodeType),
-          h.Class('bg-neutral-800 border border-neutral-700 rounded px-2 py-1'),
-          h.AriaLabel('Node type to add'),
-        ],
-        PALETTE_TYPES.map(t =>
-          h.option([h.Value(t)], [isNodeType(t) ? NODE_REGISTRY[t].label : t]),
-        ),
-      ),
-      h.button(
-        [
-          h.OnClick(
-            Message.RequestedAddNode({
-              x: Math.round(
-                model.viewport.x +
-                  BASE_W / model.viewport.zoom / 2 -
-                  NODE_W / 2 +
-                  ((model.nextNode * 37) % 160),
-              ),
-              y: Math.round(
-                model.viewport.y +
-                  BASE_H / model.viewport.zoom / 2 -
-                  60 +
-                  ((model.nextNode * 53) % 160),
-              ),
-            }),
-          ),
-          h.Class('bg-sky-700 hover:bg-sky-600 text-white rounded px-3 py-1'),
-        ],
-        ['Add node'],
-      ),
-      h.button(
-        [
-          h.OnClick(Message.RequestedNew()),
-          h.Class(
-            'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-3 py-1',
-          ),
-        ],
-        ['New'],
-      ),
-      h.button(
-        [
-          h.OnClick(Message.RequestedSave()),
-          h.Class(
-            'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-3 py-1',
-          ),
-        ],
-        ['Save'],
-      ),
-      h.button(
-        [
-          h.OnClick(Message.RequestedExport()),
-          h.Class(
-            'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-3 py-1',
-          ),
-        ],
-        ['Export'],
-      ),
-      h.button(
-        [
-          h.OnClick(Message.RequestedImport()),
-          h.Class(
-            'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-3 py-1',
-          ),
-        ],
-        ['Import'],
-      ),
-      h.button(
-        [
-          h.OnClick(Message.RequestedDeleteSelection()),
-          h.Class(
-            'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-3 py-1',
-          ),
-        ],
-        ['Delete'],
-      ),
-      h.button(
-        [
-          h.OnClick(Message.PressedGroupSelection()),
-          h.Class(
-            'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-3 py-1',
-          ),
-          h.Title('Group selected nodes (Ctrl/Cmd+G)'),
-        ],
-        ['Group'],
-      ),
-      h.button(
-        [
-          h.OnClick(Message.PressedUngroupSelection()),
-          h.Class(
-            'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-3 py-1',
-          ),
-          h.Title('Ungroup selected group (Ctrl/Cmd+Shift+G)'),
-        ],
-        ['Ungroup'],
-      ),
-      h.button(
-        [
-          h.OnClick(Message.CollapsedSelection()),
-          h.Class(
-            'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-3 py-1',
-          ),
-          h.Title('Collapse selected nodes into a container'),
-        ],
-        ['Collapse'],
-      ),
-      h.button(
-        [
-          h.OnClick(Message.OpenedSettings()),
-          h.Class(
-            'ml-auto bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-3 py-1',
-          ),
-          h.AriaLabel('Settings'),
-        ],
-        ['Settings'],
-      ),
       h.span(
-        [h.Class('text-neutral-500')],
-        [`${model.nodes.length} nodes · ${model.edges.length} edges`],
+        [h.Class('flex items-center gap-2.5 shrink-0')],
+        [
+          h.svg(
+            [h.Width('26'), h.Height('26'), h.ViewBox('0 0 26 26')],
+            [
+              h.defs(
+                [],
+                [
+                  h.linearGradient(
+                    [
+                      h.Id('brand-grad'),
+                      h.X1('0'),
+                      h.Y1('0'),
+                      h.X2('1'),
+                      h.Y2('1'),
+                    ],
+                    [
+                      h.stop([h.Offset('0'), h.StopColor('#38bdf8')]),
+                      h.stop([h.Offset('1'), h.StopColor('#6366f1')]),
+                    ],
+                  ),
+                ],
+              ),
+              h.rect([
+                h.X('1'),
+                h.Y('1'),
+                h.Width('24'),
+                h.Height('24'),
+                h.Rx('7'),
+                h.Fill('url(#brand-grad)'),
+              ]),
+              h.circle([
+                h.Cx('8.5'),
+                h.Cy('8.5'),
+                h.R('2.1'),
+                h.Fill('#f0f9ff'),
+              ]),
+              h.circle([
+                h.Cx('8.5'),
+                h.Cy('17.5'),
+                h.R('2.1'),
+                h.Fill('#f0f9ff'),
+              ]),
+              h.circle([
+                h.Cx('17.5'),
+                h.Cy('13'),
+                h.R('2.1'),
+                h.Fill('#f0f9ff'),
+              ]),
+              h.path([
+                h.D('M 8.5 8.5 L 17.5 13 M 8.5 17.5 L 17.5 13'),
+                h.Stroke('#f0f9ff'),
+                h.StrokeWidth('1.4'),
+                h.Fill('none'),
+              ]),
+            ],
+          ),
+          h.span(
+            [h.Class('leading-tight')],
+            [
+              h.span(
+                [h.Class('block text-[13.5px] font-semibold text-neutral-100')],
+                ['HLSL Editor'],
+              ),
+              h.span(
+                [
+                  h.Class(
+                    'block text-[9.5px] uppercase tracking-[0.18em] text-neutral-500',
+                  ),
+                ],
+                ['Shader graph'],
+              ),
+            ],
+          ),
+        ],
+      ),
+      h.div([h.Class(HEADER_DIVIDER)]),
+      searchView(model, h),
+      h.div(
+        [
+          h.Class(
+            'flex items-stretch rounded-lg overflow-hidden border border-[#232a36] bg-[#12151c] shrink-0',
+          ),
+        ],
+        [
+          h.select(
+            [
+              h.OnChange(value =>
+                Message.ChangedNewNodeType({ nodeType: value }),
+              ),
+              h.Value(model.newNodeType),
+              h.Class(
+                'bg-[#12151c] text-neutral-300 text-[12.5px] px-2.5 py-1.5 outline-none cursor-pointer',
+              ),
+              h.AriaLabel('Node type to add'),
+            ],
+            PALETTE_TYPES.map(t =>
+              h.option(
+                [h.Value(t)],
+                [isNodeType(t) ? NODE_REGISTRY[t].label : t],
+              ),
+            ),
+          ),
+          h.div([h.Class('w-px bg-[#232a36]')]),
+          h.button(
+            [
+              h.OnClick(
+                Message.RequestedAddNode({
+                  x: Math.round(
+                    model.viewport.x +
+                      BASE_W / model.viewport.zoom / 2 -
+                      NODE_W / 2 +
+                      ((model.nextNode * 37) % 160),
+                  ),
+                  y: Math.round(
+                    model.viewport.y +
+                      BASE_H / model.viewport.zoom / 2 -
+                      60 +
+                      ((model.nextNode * 53) % 160),
+                  ),
+                }),
+              ),
+              h.Class(
+                'bg-sky-500/15 hover:bg-sky-500/25 text-sky-300 px-3 py-1.5 text-[12.5px] font-medium transition-colors',
+              ),
+            ],
+            ['Add node'],
+          ),
+        ],
+      ),
+      h.div(
+        [h.Class('flex items-center gap-0.5 ml-auto shrink-0')],
+        [
+          headerToolButton(
+            h,
+            'New',
+            Message.RequestedNew(),
+            'Start an empty graph',
+          ),
+          headerToolButton(
+            h,
+            'Save',
+            Message.RequestedSave(),
+            'Save to browser storage',
+          ),
+          headerToolButton(
+            h,
+            'Export',
+            Message.RequestedExport(),
+            'Download graph as JSON',
+          ),
+          headerToolButton(
+            h,
+            'Import',
+            Message.RequestedImport(),
+            'Load graph from JSON',
+          ),
+          h.button(
+            [
+              h.OnClick(Message.RequestedPlay()),
+              h.Class(
+                'px-3 py-1 rounded-md text-[12.5px] font-medium bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 transition-colors',
+              ),
+              h.AriaLabel('Play'),
+              h.Title('Run the graph and preview its output color'),
+            ],
+            ['▶ Play'],
+          ),
+          h.div([h.Class(HEADER_DIVIDER)]),
+          h.button(
+            [
+              h.OnClick(Message.ToggledLogPanel()),
+              h.Class(
+                'px-2.5 py-1 rounded-md text-[12.5px] transition-colors border ' +
+                  (model.logPanelOpen
+                    ? 'text-sky-300 bg-sky-500/10 border-sky-500/30'
+                    : 'text-neutral-300 border-transparent hover:text-neutral-100 hover:bg-neutral-800/80'),
+              ),
+              h.AriaLabel('Toggle log panel'),
+              h.Title('Show or hide the log panel'),
+            ],
+            ['Log'],
+          ),
+          h.div([h.Class(HEADER_DIVIDER)]),
+          headerToolButton(
+            h,
+            'Delete',
+            Message.RequestedDeleteSelection(),
+            'Delete selection (Del)',
+          ),
+          headerToolButton(
+            h,
+            'Group',
+            Message.PressedGroupSelection(),
+            'Group selected nodes (Ctrl/Cmd+G)',
+          ),
+          headerToolButton(
+            h,
+            'Ungroup',
+            Message.PressedUngroupSelection(),
+            'Ungroup selected group (Ctrl/Cmd+Shift+G)',
+          ),
+          headerToolButton(
+            h,
+            'Collapse',
+            Message.CollapsedSelection(),
+            'Collapse selected nodes into a container',
+          ),
+          h.div([h.Class(HEADER_DIVIDER)]),
+          h.span(
+            [
+              h.Class(
+                'text-[11.5px] text-neutral-400 bg-[#12151c] border border-[#232a36] rounded-full px-3 py-1 tabular-nums shrink-0',
+              ),
+            ],
+            [
+              `${model.nodes.length} node${model.nodes.length === 1 ? '' : 's'} · ${model.edges.length} edge${model.edges.length === 1 ? '' : 's'}`,
+            ],
+          ),
+          h.button(
+            [
+              h.OnClick(Message.OpenedSettings()),
+              h.Class(
+                'ml-1 px-2 py-1 rounded-md text-[15px] text-neutral-400 hover:text-neutral-100 hover:bg-neutral-800/80 border border-transparent transition-colors leading-none',
+              ),
+              h.AriaLabel('Settings'),
+              h.Title('Keyboard shortcuts and settings'),
+            ],
+            ['⚙'],
+          ),
+        ],
+      ),
+    ],
+  )
+}
+
+// Play runs the graph numerically and previews the Fragment Output color.
+// The swatch clamps to [0,1] like an 8-bit UNORM render target, while the
+// raw components stay printed so out-of-range results remain visible.
+function playPreviewView(model: Model, h: HtmlBuilder<Message>): Html {
+  const play = Option.getOrNull(model.play)
+  if (play === null) {
+    return h.empty
+  }
+  const [r, g, b, a] = play.color
+  const clamp01 = (v: number): number => Math.min(1, Math.max(0, v))
+  const byte = (v: number): number => Math.round(clamp01(v) * 255)
+  const channel = (v: number): string => byte(v).toString(16).padStart(2, '0')
+  const hex = `#${channel(r)}${channel(g)}${channel(b)}`
+  const raw = (v: number): string =>
+    Number.isFinite(v) ? v.toFixed(4) : v > 0 ? '∞' : Number.isNaN(v) ? 'NaN' : '-∞'
+  const rows: Array<readonly [string, number]> = [
+    ['R', r],
+    ['G', g],
+    ['B', b],
+    ['A', a],
+  ]
+  return h.div(
+    [h.Class('fixed inset-0 z-40 flex items-center justify-center')],
+    [
+      h.div([
+        h.Class('absolute inset-0 bg-black/70 backdrop-blur-sm'),
+        h.OnClick(Message.DismissedPlay()),
+      ]),
+      h.div(
+        [
+          h.Class(
+            'relative w-[320px] flex flex-col gap-3 bg-[#0e1116] border border-[#232a36] rounded-2xl shadow-2xl shadow-black/60 p-4',
+          ),
+        ],
+        [
+          h.div(
+            [h.Class('flex items-baseline gap-2')],
+            [
+              h.span(
+                [h.Class('text-[13.5px] font-semibold text-neutral-100')],
+                ['▶ Play preview'],
+              ),
+              h.span([h.Class('text-[11px] text-neutral-500')], [
+                'SV_Target output',
+              ]),
+              h.button(
+                [
+                  h.OnClick(Message.DismissedPlay()),
+                  h.Class(
+                    'ml-auto text-neutral-500 hover:text-neutral-100 hover:bg-neutral-800/80 rounded-md w-6 h-6 leading-none transition-colors',
+                  ),
+                  h.AriaLabel('Close play preview'),
+                  h.Title('Close (Esc)'),
+                ],
+                ['✕'],
+              ),
+            ],
+          ),
+          h.div(
+            [
+              h.Class(
+                'play-checker rounded-xl border border-[#1c2230] overflow-hidden',
+              ),
+            ],
+            [
+              h.div(
+                [
+                  h.Class('h-36 w-full'),
+                  h.Style({
+                    backgroundColor: `rgba(${byte(r)}, ${byte(g)}, ${byte(b)}, ${clamp01(a)})`,
+                  }),
+                ],
+              ),
+            ],
+          ),
+          h.div(
+            [h.Class('flex flex-col gap-1 font-mono text-[11.5px]')],
+            [
+              ...rows.map(([label, value]) =>
+                h.div(
+                  [h.Class('flex items-center gap-2')],
+                  [
+                    h.span(
+                      [h.Class('w-4 text-neutral-500 font-sans')],
+                      [label],
+                    ),
+                    h.span([h.Class('text-neutral-200')], [raw(value)]),
+                    h.span(
+                      [h.Class('ml-auto text-neutral-500')],
+                      [`→ ${byte(value)}`],
+                    ),
+                  ],
+                ),
+              ),
+              h.div(
+                [h.Class('flex items-center gap-2 mt-1')],
+                [
+                  h.span([h.Class('w-4 text-neutral-500 font-sans')], ['HEX']),
+                  h.span([h.Class('text-emerald-300')], [hex]),
+                ],
+              ),
+            ],
+          ),
+          h.div(
+            [h.Class('text-[10.5px] text-neutral-500 leading-snug')],
+            [
+              'Raw float4 from the graph. The swatch clamps to [0,1] like an 8-bit UNORM render target.',
+            ],
+          ),
+        ],
+      ),
+    ],
+  )
+}
+
+// Session console: every connection attempt, edit, persistence action, and
+// Play run lands here with a level. Newest first so the latest event is
+// always visible without scrolling.
+const LOG_LEVEL_STYLE: Record<LogEntry['level'], string> = {
+  error: 'text-red-300',
+  warning: 'text-amber-300',
+  success: 'text-emerald-300',
+  info: 'text-neutral-200',
+  system: 'text-violet-300',
+}
+
+const LOG_LEVEL_DOT: Record<LogEntry['level'], string> = {
+  error: 'bg-red-400',
+  warning: 'bg-amber-300',
+  success: 'bg-emerald-400',
+  info: 'bg-neutral-500',
+  system: 'bg-violet-400',
+}
+
+function logPanelView(model: Model, h: HtmlBuilder<Message>): Html {
+  if (!model.logPanelOpen) {
+    return h.empty
+  }
+  const counts = (['error', 'warning'] as const)
+    .map(level => ({
+      level,
+      n: model.logs.filter(entry => entry.level === level).length,
+    }))
+    .filter(({ n }) => n > 0)
+    .map(({ level, n }) =>
+      h.span(
+        [
+          h.Class(
+            (level === 'error'
+              ? 'text-red-300 bg-red-500/10 border-red-500/30'
+              : 'text-amber-300 bg-amber-500/10 border-amber-500/30') +
+              ' text-[10px] border rounded-full px-1.5 py-px font-sans',
+          ),
+        ],
+        [`${n} ${level}${n === 1 ? '' : 's'}`],
+      ),
+    )
+  return h.div(
+    [
+      h.Class(
+        'log-panel shrink-0 h-[150px] flex flex-col border-t border-[#1c2230] bg-[#0a0c10]',
+      ),
+    ],
+    [
+      h.div(
+        [
+          h.Class(
+            'flex items-center gap-2 px-4 py-1.5 border-b border-[#161c26]',
+          ),
+        ],
+        [
+          h.span(
+            [
+              h.Class(
+                'text-[10.5px] font-semibold uppercase tracking-[0.14em] text-neutral-500',
+              ),
+            ],
+            ['Log'],
+          ),
+          ...counts,
+          h.button(
+            [
+              h.OnClick(Message.PressedClearLogs()),
+              h.Class(
+                'ml-auto text-[11px] text-neutral-500 hover:text-neutral-100 hover:bg-neutral-800/80 rounded-md px-2 py-0.5 transition-colors',
+              ),
+              h.AriaLabel('Clear log panel'),
+              h.Title('Clear all log entries'),
+            ],
+            ['Clear'],
+          ),
+          h.button(
+            [
+              h.OnClick(Message.ToggledLogPanel()),
+              h.Class(
+                'text-neutral-500 hover:text-neutral-100 hover:bg-neutral-800/80 rounded-md w-5 h-5 leading-none transition-colors',
+              ),
+              h.AriaLabel('Close log panel'),
+              h.Title('Hide the log panel'),
+            ],
+            ['✕'],
+          ),
+        ],
+      ),
+      h.div(
+        [h.Class('flex-1 overflow-y-auto px-4 py-1.5 flex flex-col gap-0.5')],
+        [
+          model.logs.length === 0
+            ? h.div(
+                [h.Class('text-[11.5px] text-neutral-600 font-mono')],
+                ['No entries yet. Connect nodes or edit the graph.'],
+              )
+            : h.empty,
+          ...model.logs.map(entry =>
+            h.div(
+              [h.Class('flex items-start gap-2 font-mono text-[11.5px]')],
+              [
+                h.span(
+                  [
+                    h.Class(
+                      `mt-[5px] w-1.5 h-1.5 rounded-full shrink-0 ${LOG_LEVEL_DOT[entry.level]}`,
+                    ),
+                  ],
+                ),
+                h.span(
+                  [
+                    h.Class(
+                      `w-14 shrink-0 uppercase text-[10px] leading-5 tracking-wide ${LOG_LEVEL_STYLE[entry.level]}`,
+                    ),
+                  ],
+                  [entry.level],
+                ),
+                h.span(
+                  [
+                    h.Class(
+                      `${LOG_LEVEL_STYLE[entry.level]} leading-5 whitespace-pre-wrap`,
+                    ),
+                  ],
+                  [entry.text],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    ],
+  )
+}
+
+// The custom group color picker: a honeycomb wheel with a grayscale row,
+// a hex field, R/G/B channels, and New/Current previews. Draft edits stay
+// in the Model; OK applies them to the group, Cancel and the backdrop
+// discard them.
+function colorPickerView(model: Model, h: HtmlBuilder<Message>): Html {
+  const picker = Option.getOrNull(model.colorPicker)
+  if (picker === null) {
+    return h.empty
+  }
+  const groupName =
+    model.groups.find(g => g.id === picker.groupId)?.name ?? picker.groupId
+  const normalized = normalizeHexColor(picker.draft)
+  const base = hexToRgb(picker.draft) ?? hexToRgb(picker.originalColor)
+  const swatch = (label: string, color: string | null): Html =>
+    h.div(
+      [h.Class('flex flex-col items-center gap-1')],
+      [
+        h.div([
+          h.Class(
+            'w-8 h-8 rounded-md border ' +
+              (color === null
+                ? 'border-dashed border-neutral-600'
+                : 'border-[#2a3240]'),
+          ),
+          h.Style(color === null ? {} : { backgroundColor: color }),
+        ]),
+        h.span(
+          [h.Class('text-[9.5px] uppercase tracking-wide text-neutral-500')],
+          [label],
+        ),
+      ],
+    )
+  return h.div(
+    [h.Class('fixed inset-0 z-40 flex items-center justify-center')],
+    [
+      h.div([
+        h.Class('absolute inset-0 bg-black/70 backdrop-blur-sm'),
+        h.OnClick(Message.CancelledGroupColorPicker()),
+      ]),
+      h.div(
+        [
+          h.Class(
+            'relative w-[300px] flex flex-col gap-3 bg-[#0e1116] border border-[#232a36] rounded-2xl shadow-2xl shadow-black/60 p-4',
+          ),
+        ],
+        [
+          h.div(
+            [h.Class('flex items-baseline gap-2')],
+            [
+              h.span(
+                [h.Class('text-[13.5px] font-semibold text-neutral-100')],
+                ['Custom color'],
+              ),
+              h.span([h.Class('text-[11px] text-neutral-500')], [groupName]),
+            ],
+          ),
+          h.svg(
+            [
+              h.Width(String(PICKER_W)),
+              h.Height(String(PICKER_H)),
+              h.ViewBox(`0 0 ${PICKER_W} ${PICKER_H}`),
+              h.Class('block rounded-lg bg-[#0a0c10] border border-[#1c2230]'),
+            ],
+            [
+              ...HONEYCOMB.map(cell =>
+                h.polygon([
+                  h.Points(cell.points),
+                  h.Fill(cell.color),
+                  h.Stroke(cell.color === normalized ? '#ffffff' : '#0a0c10'),
+                  h.StrokeWidth(cell.color === normalized ? '2' : '1'),
+                  h.Cursor('pointer'),
+                  h.Class('picker-cell'),
+                  h.OnClick(
+                    Message.EditedGroupColorDraft({ text: cell.color }),
+                  ),
+                  h.AriaLabel(`Pick color ${cell.color}`),
+                ]),
+              ),
+              ...GRAYSCALE.map(cell =>
+                h.polygon([
+                  h.Points(cell.points),
+                  h.Fill(cell.color),
+                  h.Stroke(cell.color === normalized ? '#ffffff' : '#0a0c10'),
+                  h.StrokeWidth(cell.color === normalized ? '2' : '1'),
+                  h.Cursor('pointer'),
+                  h.Class('picker-cell'),
+                  h.OnClick(
+                    Message.EditedGroupColorDraft({ text: cell.color }),
+                  ),
+                  h.AriaLabel(`Pick grayscale ${cell.color}`),
+                ]),
+              ),
+            ],
+          ),
+          h.div(
+            [h.Class('flex items-center gap-2')],
+            [
+              h.span(
+                [h.Class('w-12 text-[11.5px] text-neutral-400')],
+                ['HTML'],
+              ),
+              h.input([
+                h.Type('text'),
+                h.Value(picker.draft),
+                h.OnInput(text => Message.EditedGroupColorDraft({ text })),
+                h.Class(
+                  'flex-1 min-w-0 bg-[#12151c] border rounded-md px-2.5 py-1.5 text-[12.5px] font-mono text-neutral-100 focus:outline-none transition-colors ' +
+                    (normalized === null
+                      ? 'border-red-500/50'
+                      : 'border-[#232a36] focus:border-sky-500/50'),
+                ),
+                h.AriaLabel('Color hex'),
+                h.Spellcheck(false),
+              ]),
+              swatch('New', normalized),
+              swatch('Current', picker.originalColor),
+            ],
+          ),
+          h.div(
+            [h.Class('flex items-center gap-2')],
+            [
+              h.span([h.Class('w-12 text-[11.5px] text-neutral-400')], ['RGB']),
+              ...(
+                [
+                  ['R', 'r'],
+                  ['G', 'g'],
+                  ['B', 'b'],
+                ] as const
+              ).map(([label, key]) =>
+                h.label(
+                  [h.Class('flex items-center gap-1')],
+                  [
+                    h.span(
+                      [h.Class('text-[10px] font-mono text-neutral-500')],
+                      [label],
+                    ),
+                    h.input([
+                      h.Type('number'),
+                      h.Min('0'),
+                      h.Max('255'),
+                      h.Value(base === null ? '' : String(base[key])),
+                      h.OnInput(valueText => {
+                        const parsed = Number(valueText)
+                        const from = base === null ? { r: 0, g: 0, b: 0 } : base
+                        if (!Number.isFinite(parsed)) {
+                          return Message.EditedGroupColorDraft({
+                            text: rgbToHex(from),
+                          })
+                        }
+                        const next = rgbFromChannels(
+                          key === 'r' ? parsed : from.r,
+                          key === 'g' ? parsed : from.g,
+                          key === 'b' ? parsed : from.b,
+                        )
+                        return Message.EditedGroupColorDraft({
+                          text: rgbToHex(next),
+                        })
+                      }),
+                      h.Class(
+                        'w-16 bg-[#12151c] border border-[#232a36] rounded-md px-2 py-1.5 text-[12px] text-neutral-100 focus:outline-none focus:border-sky-500/50 transition-colors',
+                      ),
+                      h.AriaLabel(`Color ${label}`),
+                    ]),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          h.div(
+            [h.Class('flex items-center gap-2 mt-1')],
+            [
+              h.button(
+                [
+                  h.OnClick(Message.CancelledGroupColorPicker()),
+                  h.Class(
+                    'px-3 py-1.5 rounded-md text-[12.5px] text-neutral-300 hover:text-neutral-100 hover:bg-neutral-800/80 border border-transparent transition-colors',
+                  ),
+                  h.AriaLabel('Cancel custom color'),
+                ],
+                ['Cancel'],
+              ),
+              h.button(
+                [
+                  h.OnClick(Message.AppliedGroupColorDraft()),
+                  h.Class(
+                    'ml-auto bg-sky-500/15 hover:bg-sky-500/25 border border-sky-500/30 text-sky-300 rounded-md px-4 py-1.5 text-[12.5px] font-medium transition-colors ' +
+                      (normalized === null
+                        ? 'opacity-40 pointer-events-none'
+                        : ''),
+                  ),
+                  h.AriaLabel('Apply custom color'),
+                ],
+                ['OK'],
+              ),
+            ],
+          ),
+        ],
       ),
     ],
   )
@@ -440,29 +1075,36 @@ function settingsView(model: Model, h: HtmlBuilder<Message>): Html {
     [h.Class('fixed inset-0 z-40 flex items-center justify-center')],
     [
       h.div([
-        h.Class('absolute inset-0 bg-black/60'),
+        h.Class('absolute inset-0 bg-black/70 backdrop-blur-sm'),
         h.OnClick(Message.ClosedSettings()),
       ]),
       h.div(
         [
           h.Class(
-            'relative w-[640px] max-h-[80vh] flex flex-col bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl',
+            'relative w-[680px] max-h-[80vh] flex flex-col bg-[#0e1116] border border-[#232a36] rounded-2xl shadow-2xl shadow-black/60 overflow-hidden',
           ),
         ],
         [
           h.div(
             [
               h.Class(
-                'flex items-center px-3 py-2 border-b border-neutral-800',
+                'flex items-center px-4 h-12 border-b border-[#1c2230] shrink-0',
               ),
             ],
             [
-              h.span([h.Class('font-semibold text-neutral-100')], ['Settings']),
+              h.span(
+                [h.Class('text-[13.5px] font-semibold text-neutral-100')],
+                ['Settings'],
+              ),
+              h.span(
+                [h.Class('ml-3 text-[11.5px] text-neutral-500')],
+                ['Keyboard shortcuts'],
+              ),
               h.button(
                 [
                   h.OnClick(Message.ClosedSettings()),
                   h.Class(
-                    'ml-auto text-neutral-400 hover:text-neutral-100 px-2 leading-none',
+                    'ml-auto text-neutral-500 hover:text-neutral-100 hover:bg-neutral-800/80 rounded-md px-2 py-0.5 leading-none text-[16px] transition-colors',
                   ),
                   h.AriaLabel('Close settings'),
                 ],
@@ -472,12 +1114,12 @@ function settingsView(model: Model, h: HtmlBuilder<Message>): Html {
           ),
           shortcutPlatformToggle(model, h),
           h.div(
-            [h.Class('flex-1 overflow-auto min-h-0')],
+            [h.Class('flex-1 overflow-auto min-h-0 py-1')],
             SHORTCUT_CATEGORIES.flatMap(category => [
               h.div(
                 [
                   h.Class(
-                    'px-3 pt-3 pb-1 text-[10px] uppercase tracking-wide text-neutral-500',
+                    'px-4 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-neutral-500',
                   ),
                 ],
                 [category],
@@ -490,19 +1132,19 @@ function settingsView(model: Model, h: HtmlBuilder<Message>): Html {
           h.div(
             [
               h.Class(
-                'flex items-center gap-3 px-3 py-2 border-t border-neutral-800',
+                'flex items-center gap-3 px-4 py-3 border-t border-[#1c2230] shrink-0',
               ),
             ],
             [
               h.span(
-                [h.Class('text-xs text-neutral-500')],
+                [h.Class('text-[11.5px] text-neutral-500')],
                 ['Click Record, then press the keys you want. Esc cancels.'],
               ),
               h.button(
                 [
                   h.OnClick(Message.ResetAllShortcuts()),
                   h.Class(
-                    'ml-auto bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-3 py-1',
+                    'ml-auto bg-[#1a2029] hover:bg-[#232b37] border border-[#2a3240] rounded-md px-3 py-1.5 text-[12px] text-neutral-200 transition-colors',
                   ),
                   h.AriaLabel('Reset all shortcuts'),
                 ],
@@ -518,17 +1160,21 @@ function settingsView(model: Model, h: HtmlBuilder<Message>): Html {
 
 function shortcutPlatformToggle(model: Model, h: HtmlBuilder<Message>): Html {
   return h.div(
-    [h.Class('flex items-center gap-2 px-3 py-2 border-b border-neutral-800')],
     [
-      h.span([h.Class('text-neutral-400')], ['Shortcut display']),
+      h.Class(
+        'flex items-center gap-2 px-4 py-2.5 border-b border-[#1c2230] shrink-0',
+      ),
+    ],
+    [
+      h.span([h.Class('text-[12px] text-neutral-400')], ['Shortcut display']),
       ...SHORTCUT_PLATFORMS.map(platform =>
         h.button(
           [
             h.OnClick(Message.ChangedShortcutPlatform({ platform })),
             h.Class(
               platform === model.shortcutPlatform
-                ? 'bg-sky-700 text-white rounded px-2 py-0.5'
-                : 'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-2 py-0.5',
+                ? 'bg-sky-500/15 text-sky-300 border border-sky-500/30 rounded-md px-2.5 py-1 text-[11.5px] font-medium'
+                : 'text-neutral-400 hover:text-neutral-100 hover:bg-neutral-800/80 border border-transparent rounded-md px-2.5 py-1 text-[11.5px] transition-colors',
             ),
             h.AriaPressed(
               platform === model.shortcutPlatform ? 'true' : 'false',
@@ -553,18 +1199,29 @@ function shortcutRow(
   const binding = bindingFor(model.keymap, command)
   const changed = !bindingsEqual(binding, command.defaultBinding)
   return h.div(
-    [h.Class('flex items-center gap-2 px-3 py-2 border-b border-neutral-800')],
     [
-      h.span([h.Class('flex-1 text-neutral-200')], [command.label]),
+      h.Class(
+        'flex items-center gap-3 px-4 py-2 border-b border-[#141a23] hover:bg-white/[0.02]',
+      ),
+    ],
+    [
+      h.span(
+        [h.Class('flex-1 text-[12.5px] text-neutral-200')],
+        [command.label],
+      ),
       recording
         ? h.span(
-            [h.Class('font-mono px-2 py-0.5 rounded text-amber-300')],
+            [
+              h.Class(
+                'font-mono px-2 py-0.5 rounded-md text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/25 min-w-24 text-center',
+              ),
+            ],
             ['Press keys…'],
           )
         : h.span(
             [
               h.Class(
-                'font-mono px-2 py-0.5 bg-neutral-800 rounded text-neutral-300 min-w-24 text-center',
+                'font-mono px-2 py-0.5 bg-[#161b22] border border-[#2a3140] rounded-md text-[11px] text-neutral-300 min-w-24 text-center',
               ),
             ],
             [formatShortcut(binding, model.shortcutPlatform)],
@@ -574,7 +1231,7 @@ function shortcutRow(
             [
               h.OnClick(Message.CancelledShortcutRecording()),
               h.Class(
-                'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-2 py-0.5',
+                'text-neutral-400 hover:text-neutral-100 hover:bg-neutral-800/80 rounded-md px-2 py-0.5 text-[11.5px] border border-transparent transition-colors',
               ),
               h.AriaLabel(`Cancel recording for ${command.label}`),
             ],
@@ -586,7 +1243,7 @@ function shortcutRow(
                 Message.StartedShortcutRecording({ actionId: command.id }),
               ),
               h.Class(
-                'bg-sky-700 hover:bg-sky-600 text-white rounded px-2 py-0.5',
+                'text-sky-300 hover:bg-sky-500/10 rounded-md px-2 py-0.5 text-[11.5px] font-medium border border-transparent transition-colors',
               ),
               h.AriaLabel(`Record shortcut for ${command.label}`),
             ],
@@ -597,7 +1254,7 @@ function shortcutRow(
             [
               h.OnClick(Message.ResetShortcut({ actionId: command.id })),
               h.Class(
-                'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-2 py-0.5',
+                'text-neutral-400 hover:text-neutral-100 hover:bg-neutral-800/80 rounded-md px-2 py-0.5 text-[11.5px] border border-transparent transition-colors',
               ),
               h.AriaLabel(`Reset shortcut for ${command.label}`),
             ],
@@ -615,7 +1272,7 @@ function searchView(
   const query = model.searchText.trim()
   const results = defaultOnSearch(model.nodes, model.searchText)
   return h.div(
-    [h.Class('relative')],
+    [h.Class('relative shrink-0')],
     [
       h.input([
         h.Type('text'),
@@ -623,7 +1280,7 @@ function searchView(
         h.Placeholder('Search nodes…'),
         h.OnInput(text => Message.ChangedSearch({ text })),
         h.Class(
-          'w-56 bg-neutral-800 border border-neutral-700 rounded px-2 py-1 text-neutral-100 placeholder:text-neutral-500',
+          'w-52 bg-[#12151c] border border-[#232a36] rounded-lg px-3 py-1.5 text-[12.5px] text-neutral-100 placeholder:text-neutral-600 focus:outline-none focus:border-sky-500/50 transition-colors',
         ),
         h.AriaLabel('Search nodes'),
       ]),
@@ -632,13 +1289,13 @@ function searchView(
         : h.div(
             [
               h.Class(
-                'absolute left-0 top-full mt-1 w-72 max-h-64 overflow-auto bg-neutral-900 border border-neutral-700 rounded shadow-lg z-20 flex flex-col',
+                'absolute left-0 top-full mt-1.5 w-72 max-h-64 overflow-auto bg-[#12151c]/95 backdrop-blur border border-[#232a36] rounded-xl shadow-2xl shadow-black/50 z-20 flex flex-col p-1',
               ),
             ],
             results.length === 0
               ? [
                   h.div(
-                    [h.Class('px-2 py-1 text-neutral-500')],
+                    [h.Class('px-2.5 py-1.5 text-[12px] text-neutral-500')],
                     ['No matching nodes.'],
                   ),
                 ]
@@ -650,13 +1307,20 @@ function searchView(
                         Message.SelectedSearchResult({ nodeId: node.id }),
                       ),
                       h.Class(
-                        'flex items-center gap-2 px-2 py-1 text-left hover:bg-neutral-800',
+                        'flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-left hover:bg-neutral-800/70',
                       ),
                     ],
                     [
-                      h.span([h.Class('text-neutral-200')], [nodeLabel(node)]),
                       h.span(
-                        [h.Class('ml-auto text-xs text-neutral-500')],
+                        [h.Class('text-[12.5px] text-neutral-200')],
+                        [nodeLabel(node)],
+                      ),
+                      h.span(
+                        [
+                          h.Class(
+                            'ml-auto text-[10.5px] font-mono text-neutral-500',
+                          ),
+                        ],
                         [node.id],
                       ),
                     ],
@@ -702,12 +1366,12 @@ function canvasView(
   const w = BASE_W / model.viewport.zoom
   const ww = BASE_H / model.viewport.zoom
   return h.div(
-    [h.Class('flex-1 relative min-w-0 bg-neutral-950')],
+    [h.Class('flex-1 relative min-w-0 bg-[#0a0c10]')],
     [
       h.div(
         [
           h.Class(
-            'absolute top-2 left-2 flex items-center gap-2 z-10 bg-neutral-900/85 border border-neutral-800 rounded px-2 py-1',
+            'absolute bottom-3 left-3 flex items-center gap-2 z-10 rounded-xl border border-[#232a36] bg-[#12151c]/90 backdrop-blur px-3 py-2 shadow-xl shadow-black/30',
           ),
         ],
         [
@@ -718,31 +1382,38 @@ function canvasView(
             h.Step('5'),
             h.Value(String(Math.round(model.viewport.zoom * 100))),
             h.OnInput(valueText => Message.ChangedZoom({ valueText })),
-            h.Class('w-40 accent-sky-500'),
+            h.Class('w-32 accent-sky-400'),
             h.AriaLabel('Zoom'),
           ]),
           h.span(
-            [h.Class('w-10 text-right text-neutral-400')],
+            [
+              h.Class(
+                'w-10 text-right text-[11.5px] text-neutral-400 tabular-nums',
+              ),
+            ],
             [`${Math.round(model.viewport.zoom * 100)}%`],
           ),
           h.button(
             [
               h.OnClick(Message.ResetView()),
               h.Class(
-                'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-2 py-1',
+                'text-[11.5px] text-neutral-400 hover:text-neutral-100 hover:bg-neutral-800/80 rounded-md px-2 py-0.5 border border-transparent transition-colors',
               ),
+              h.AriaLabel('Reset view'),
+              h.Title('Reset view'),
             ],
             ['Reset'],
           ),
-          h.span([h.Class('w-px h-5 bg-neutral-700')]),
+          h.span([h.Class('w-px h-5 bg-[#232a36]')]),
           h.button(
             [
               h.OnClick(Message.ToggledSimulateLoading()),
               h.Class(
                 model.simulateLoading
-                  ? 'bg-sky-700 hover:bg-sky-600 text-white rounded px-2 py-1'
-                  : 'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-2 py-1',
+                  ? 'text-[11.5px] text-sky-300 bg-sky-500/15 border border-sky-500/30 rounded-md px-2 py-0.5'
+                  : 'text-[11.5px] text-neutral-400 hover:text-neutral-100 hover:bg-neutral-800/80 border border-transparent rounded-md px-2 py-0.5 transition-colors',
               ),
+              h.AriaPressed(model.simulateLoading ? 'true' : 'false'),
             ],
             ['Simulate loading'],
           ),
@@ -751,7 +1422,7 @@ function canvasView(
               h.OnChange(variant => Message.ChangedLoadingVariant({ variant })),
               h.Value(model.loadingVariant),
               h.Class(
-                'bg-neutral-800 border border-neutral-700 rounded px-2 py-1',
+                'bg-[#12151c] border border-[#232a36] rounded-md px-1.5 py-0.5 text-[11.5px] text-neutral-300 outline-none cursor-pointer',
               ),
               h.AriaLabel('Loading variant'),
             ],
@@ -780,12 +1451,33 @@ function canvasView(
           h.OnContextMenu(Message.PreventedNativeContextMenu()),
         ],
         [
+          h.defs(
+            [],
+            [
+              h.pattern(
+                [
+                  h.Id('dot-grid'),
+                  h.Width('26'),
+                  h.Height('26'),
+                  h.PatternUnits('userSpaceOnUse'),
+                ],
+                [
+                  h.circle([
+                    h.Cx('1.1'),
+                    h.Cy('1.1'),
+                    h.R('1.1'),
+                    h.Fill('#1c232d'),
+                  ]),
+                ],
+              ),
+            ],
+          ),
           h.rect([
             h.X(String(model.viewport.x - 2000)),
             h.Y(String(model.viewport.y - 2000)),
             h.Width(String(w + 4000)),
             h.Height(String(ww + 4000)),
-            h.Fill('#0a0a0b'),
+            h.Fill('url(#dot-grid)'),
             h.Class('graph-canvas'),
             h.OnPointerDown(
               (
@@ -837,7 +1529,7 @@ function canvasView(
                 h.Y(String(marquee.minY)),
                 h.Width(String(marquee.maxX - marquee.minX)),
                 h.Height(String(marquee.maxY - marquee.minY)),
-                h.Fill('rgba(34,211,238,0.12)'),
+                h.Fill('rgba(56,189,248,0.08)'),
                 h.Stroke(HIGHLIGHT_COLOR),
                 h.StrokeWidth('1'),
                 h.StrokeDasharray('6 4'),
@@ -861,11 +1553,12 @@ function canvasView(
                     h.Y(String(rect.y)),
                     h.Width(String(rect.width)),
                     h.Height(String(rect.height)),
-                    h.Rx('10'),
+                    h.Rx('12'),
                     h.Fill(group.color),
-                    h.FillOpacity('0.08'),
+                    h.FillOpacity('0.06'),
                     h.Stroke(group.color),
-                    h.StrokeWidth(selected ? '2.5' : '1.5'),
+                    h.StrokeOpacity(selected ? '0.9' : '0.45'),
+                    h.StrokeWidth(selected ? '2' : '1.25'),
                     h.Cursor('pointer'),
                     h.OnClick(Message.SelectedGroup({ groupId: group.id })),
                   ]),
@@ -874,17 +1567,17 @@ function canvasView(
                     h.Y(String(rect.y)),
                     h.Width(String(rect.width)),
                     h.Height(String(GROUP_HEADER)),
-                    h.Rx('10'),
+                    h.Rx('12'),
                     h.Fill(group.color),
-                    h.FillOpacity('0.22'),
+                    h.FillOpacity('0.16'),
                     h.PointerEvents('none'),
                   ]),
                   h.text(
                     [
                       h.X(String(rect.x + GROUP_PAD / 2)),
                       h.Y(String(rect.y + 15)),
-                      h.Fill('#f0f6fc'),
-                      h.FontSize('12'),
+                      h.Fill('#dbe4ee'),
+                      h.FontSize('11.5'),
                       h.FontWeight('600'),
                       h.PointerEvents('none'),
                     ],
@@ -926,11 +1619,11 @@ function canvasView(
                   h.Y(String(rect.y)),
                   h.Width(String(rect.width)),
                   h.Height(String(rect.height)),
-                  h.Rx('10'),
-                  h.Fill('#1f2937'),
-                  h.FillOpacity('0.55'),
-                  h.Stroke(selected ? '#58a6ff' : '#6b7280'),
-                  h.StrokeWidth(selected ? '2.5' : '1.5'),
+                  h.Rx('12'),
+                  h.Fill('#141922'),
+                  h.FillOpacity('0.72'),
+                  h.Stroke(selected ? HIGHLIGHT_COLOR : '#39424f'),
+                  h.StrokeWidth(selected ? '2' : '1.25'),
                   h.Cursor('pointer'),
                   h.OnClick(
                     Message.SelectedCollapsed({ collapsedId: entry.id }),
@@ -941,17 +1634,17 @@ function canvasView(
                   h.Y(String(rect.y)),
                   h.Width(String(rect.width)),
                   h.Height('24'),
-                  h.Rx('10'),
-                  h.Fill('#6b7280'),
-                  h.FillOpacity('0.35'),
+                  h.Rx('12'),
+                  h.Fill('#39424f'),
+                  h.FillOpacity('0.3'),
                   h.PointerEvents('none'),
                 ]),
                 h.text(
                   [
                     h.X(String(rect.x + 8)),
                     h.Y(String(rect.y + 16)),
-                    h.Fill('#f0f6fc'),
-                    h.FontSize('12'),
+                    h.Fill('#dbe4ee'),
+                    h.FontSize('11.5'),
                     h.FontWeight('600'),
                     h.PointerEvents('none'),
                   ],
@@ -961,8 +1654,8 @@ function canvasView(
                   [
                     h.X(String(rect.x + 8)),
                     h.Y(String(rect.y + rect.height - 8)),
-                    h.Fill('#9ca3af'),
-                    h.FontSize('11'),
+                    h.Fill('#7d8898'),
+                    h.FontSize('10.5'),
                     h.PointerEvents('none'),
                   ],
                   [
@@ -1009,7 +1702,7 @@ function canvasView(
               ? '#f85149'
               : active
                 ? HIGHLIGHT_COLOR
-                : '#3fb950'
+                : wireColor(model, edge)
             return [
               // A wide, invisible stroke gives the thin wire a usable hit
               // area for hover and click.
@@ -1036,7 +1729,11 @@ function canvasView(
                 h.D(d),
                 h.Fill('none'),
                 h.Stroke(stroke),
-                h.StrokeWidth(active ? '3.5' : invalid ? '2.5' : '2'),
+                h.StrokeWidth(active ? '3.5' : invalid ? '2.25' : '2'),
+                h.StrokeLinecap('round'),
+                h.StrokeOpacity(invalid ? '0.9' : active ? '1' : '0.85'),
+                ...(invalid ? [h.StrokeDasharray('7 5')] : []),
+                ...(active ? [h.Class('graph-edge-glow')] : []),
                 h.PointerEvents('none'),
               ]),
             ]
@@ -1094,7 +1791,7 @@ function minimapView(model: Model, h: HtmlBuilder<Message>): Html {
       [
         h.OnClick(Message.ToggledMinimap()),
         h.Class(
-          'absolute bottom-3 right-3 z-10 bg-neutral-900/90 hover:bg-neutral-800 border border-neutral-700 rounded px-2 py-1 text-neutral-300',
+          'absolute bottom-3 right-3 z-10 bg-[#12151c]/90 hover:bg-[#1a2029] border border-[#232a36] rounded-lg px-2 py-1 text-[12px] text-neutral-400 hover:text-neutral-100 transition-colors',
         ),
         h.AriaLabel('Show minimap'),
         h.Title('Show minimap'),
@@ -1116,7 +1813,7 @@ function minimapView(model: Model, h: HtmlBuilder<Message>): Html {
   return h.div(
     [
       h.Class(
-        'minimap absolute bottom-3 right-3 z-10 bg-neutral-900/90 border border-neutral-700 rounded shadow-lg p-1',
+        'minimap absolute bottom-3 right-3 z-10 bg-[#12151c]/90 backdrop-blur border border-[#232a36] rounded-xl shadow-xl shadow-black/40 p-1.5',
       ),
     ],
     [
@@ -1124,14 +1821,18 @@ function minimapView(model: Model, h: HtmlBuilder<Message>): Html {
         [h.Class('flex items-center justify-between px-1 pb-1')],
         [
           h.span(
-            [h.Class('text-[10px] uppercase tracking-wide text-neutral-500')],
+            [
+              h.Class(
+                'text-[9.5px] font-semibold uppercase tracking-[0.14em] text-neutral-500',
+              ),
+            ],
             ['Minimap'],
           ),
           h.button(
             [
               h.OnClick(Message.ToggledMinimap()),
               h.Class(
-                'text-neutral-400 hover:text-neutral-100 px-1 leading-none',
+                'text-neutral-500 hover:text-neutral-100 px-1 leading-none transition-colors',
               ),
               h.AriaLabel('Hide minimap'),
               h.Title('Hide minimap'),
@@ -1145,7 +1846,7 @@ function minimapView(model: Model, h: HtmlBuilder<Message>): Html {
           h.Width(String(MINIMAP_W)),
           h.Height(String(MINIMAP_H)),
           h.ViewBox(`0 0 ${MINIMAP_W} ${MINIMAP_H}`),
-          h.Class('block rounded bg-neutral-950'),
+          h.Class('block rounded-lg bg-[#0a0c10] border border-[#1c2230]'),
         ],
         [
           ...model.edges.flatMap(edge => {
@@ -1163,7 +1864,7 @@ function minimapView(model: Model, h: HtmlBuilder<Message>): Html {
                 h.Y1(my(from.position.y + nodeHeight(from.type) / 2)),
                 h.X2(mx(to.position.x)),
                 h.Y2(my(to.position.y + nodeHeight(to.type) / 2)),
-                h.Stroke('#3fb950'),
+                h.Stroke('#333c49'),
                 h.StrokeWidth('1'),
               ]),
             ]
@@ -1181,9 +1882,9 @@ function minimapView(model: Model, h: HtmlBuilder<Message>): Html {
                     h.Height(
                       String(Math.max(nodeHeight(node.type) * t.scale, 2)),
                     ),
-                    h.Rx('1'),
-                    h.Fill('#30363d'),
-                    h.Stroke('#58a6ff'),
+                    h.Rx('1.5'),
+                    h.Fill('#222a36'),
+                    h.Stroke('#3d8fc7'),
                     h.StrokeWidth('0.5'),
                   ]),
                 ],
@@ -1193,7 +1894,7 @@ function minimapView(model: Model, h: HtmlBuilder<Message>): Html {
             h.Y(my(model.viewport.y)),
             h.Width(String(Math.max(viewW * t.scale, 4))),
             h.Height(String(Math.max(viewH * t.scale, 4))),
-            h.Fill('rgba(34,211,238,0.10)'),
+            h.Fill('rgba(56,189,248,0.08)'),
             h.Stroke(HIGHLIGHT_COLOR),
             h.StrokeWidth('1'),
             h.Class('minimap-viewport'),
@@ -1223,7 +1924,7 @@ function contextMenuView(model: Model, h: HtmlBuilder<Message>): Html {
   return h.div(
     [
       h.Class(
-        'context-menu fixed z-30 w-56 max-h-80 overflow-auto bg-neutral-900 border border-neutral-700 rounded shadow-xl flex flex-col',
+        'context-menu fixed z-30 w-60 max-h-80 overflow-auto bg-[#12151c]/95 backdrop-blur border border-[#232a36] rounded-xl shadow-2xl shadow-black/50 flex flex-col py-1',
       ),
       h.Style({ left: `${menu.clientX}px`, top: `${menu.clientY}px` }),
     ],
@@ -1235,14 +1936,17 @@ function contextMenuView(model: Model, h: HtmlBuilder<Message>): Html {
         h.OnInput(text => Message.ChangedContextMenuSearch({ text })),
         h.Autofocus(true),
         h.Class(
-          'bg-neutral-800 border-b border-neutral-700 px-2 py-1 text-neutral-100 placeholder:text-neutral-500',
+          'bg-transparent border-b border-[#232a36] px-3 py-2 mb-1 text-[12.5px] text-neutral-100 placeholder:text-neutral-600 focus:outline-none',
         ),
         h.AriaLabel('Search nodes to add'),
       ]),
       types.length === 0
-        ? h.div([h.Class('px-2 py-1 text-neutral-500')], ['No matching nodes.'])
+        ? h.div(
+            [h.Class('px-3 py-1.5 text-[12px] text-neutral-500')],
+            ['No matching nodes.'],
+          )
         : h.div(
-            [h.Class('flex flex-col')],
+            [h.Class('flex flex-col px-1')],
             types.map(type =>
               h.button(
                 [
@@ -1250,17 +1954,23 @@ function contextMenuView(model: Model, h: HtmlBuilder<Message>): Html {
                     Message.SelectedContextMenuNode({ nodeType: type }),
                   ),
                   h.Class(
-                    'context-menu-item flex items-center gap-2 px-2 py-1 text-left hover:bg-sky-800',
+                    'context-menu-item flex items-center gap-2 px-2 py-1.5 rounded-lg text-left hover:bg-sky-500/10 hover:text-sky-200 transition-colors',
                   ),
                   h.AriaLabel(`Add ${NODE_REGISTRY[type].label}`),
                 ],
                 [
                   h.span(
-                    [h.Class('text-neutral-200')],
+                    [h.Class('text-[12.5px] text-neutral-200')],
                     [NODE_REGISTRY[type].label],
                   ),
                   h.span(
-                    [h.Class('ml-auto text-xs text-neutral-500')],
+                    [
+                      h.Class('ml-auto text-[10px] px-1.5 py-0.5 rounded'),
+                      h.Style({
+                        backgroundColor: `${categoryColor(NODE_REGISTRY[type].category)}1f`,
+                        color: categoryColor(NODE_REGISTRY[type].category),
+                      }),
+                    ],
                     [NODE_REGISTRY[type].category],
                   ),
                 ],
@@ -1348,7 +2058,7 @@ function nodeMenuView(model: Model, h: HtmlBuilder<Message>): Html {
   return h.div(
     [
       h.Class(
-        'context-menu fixed z-30 w-56 max-h-80 overflow-auto bg-neutral-900 border border-neutral-700 rounded shadow-xl flex flex-col',
+        'context-menu fixed z-30 w-56 max-h-80 overflow-auto bg-[#12151c]/95 backdrop-blur border border-[#232a36] rounded-xl shadow-2xl shadow-black/50 flex flex-col py-1',
       ),
       h.Style({ left: `${menu.clientX}px`, top: `${menu.clientY}px` }),
     ],
@@ -1356,7 +2066,7 @@ function nodeMenuView(model: Model, h: HtmlBuilder<Message>): Html {
       h.div(
         [
           h.Class(
-            'px-2 py-1 text-[10px] uppercase tracking-wide text-neutral-500 border-b border-neutral-800',
+            'px-3 py-1.5 mb-1 text-[10px] font-mono uppercase tracking-wide text-neutral-500 border-b border-[#232a36]',
           ),
         ],
         [
@@ -1368,7 +2078,7 @@ function nodeMenuView(model: Model, h: HtmlBuilder<Message>): Html {
           [
             h.OnClick(action.message),
             h.Class(
-              'context-menu-item px-2 py-1 text-left hover:bg-sky-800 text-neutral-200',
+              'context-menu-item mx-1 px-2 py-1.5 rounded-lg text-left hover:bg-sky-500/10 hover:text-sky-200 text-[12.5px] text-neutral-200 transition-colors',
             ),
           ],
           [action.label],
@@ -1378,7 +2088,7 @@ function nodeMenuView(model: Model, h: HtmlBuilder<Message>): Html {
         [
           h.OnClick(Message.DismissedNodeMenu()),
           h.Class(
-            'context-menu-item px-2 py-1 text-left hover:bg-neutral-800 text-neutral-400 border-t border-neutral-800',
+            'context-menu-item mx-1 mt-1 px-2 py-1.5 rounded-lg text-left hover:bg-neutral-800/70 text-[12.5px] text-neutral-500 hover:text-neutral-300 border-t border-[#232a36] transition-colors',
           ),
         ],
         ['Dismiss'],
@@ -1404,8 +2114,16 @@ function rerouteNodeView(
       ? declarationOfUsage(model, node.id)
       : null
   const name = declarationId === null ? '' : rerouteName(model, declarationId)
-  const fill = isDeclaration ? '#6d28d9' : isUsage ? '#1d4ed8' : '#161b22'
-  const stroke = selected ? '#58a6ff' : STATUS_COLORS[status]
+  const fill = isDeclaration ? '#7c3aed' : isUsage ? '#2563eb' : '#1a2029'
+  const stroke = selected
+    ? HIGHLIGHT_COLOR
+    : status === 'error'
+      ? '#f85149'
+      : status === 'warning'
+        ? '#d29922'
+        : isDeclaration || isUsage
+          ? '#8b5cf6'
+          : '#39424f'
   return h.g(
     [h.Transform(`translate(${node.position.x},${node.position.y})`)],
     [
@@ -1415,7 +2133,7 @@ function rerouteNodeView(
             h.Cy(String(size / 2)),
             h.R(String(size / 2 + 3)),
             h.Fill('none'),
-            h.Stroke(selected ? '#58a6ff' : HIGHLIGHT_COLOR),
+            h.Stroke(HIGHLIGHT_COLOR),
             h.StrokeWidth('2'),
             ...(selected ? [] : [h.StrokeDasharray('6 4')]),
           ])
@@ -1450,7 +2168,7 @@ function rerouteNodeView(
         h.Cy(String(size / 2)),
         h.R('5'),
         h.Fill(typeColor('float')),
-        h.Stroke('#0d1117'),
+        h.Stroke('#0a0c10'),
         h.StrokeWidth('2'),
         h.PointerEvents('none'),
       ]),
@@ -1459,7 +2177,7 @@ function rerouteNodeView(
         h.Cy(String(size / 2)),
         h.R('5'),
         h.Fill(typeColor('float')),
-        h.Stroke('#0d1117'),
+        h.Stroke('#0a0c10'),
         h.StrokeWidth('2'),
         h.PointerEvents('none'),
       ]),
@@ -1495,42 +2213,59 @@ function nodeView(
   const label = isNodeType(node.type)
     ? NODE_REGISTRY[node.type].label
     : node.type
+  const category = isNodeType(node.type)
+    ? NODE_REGISTRY[node.type].category
+    : 'Utility'
   const inputs = isNodeType(node.type) ? NODE_REGISTRY[node.type].inputs : []
   const outputs = isNodeType(node.type) ? NODE_REGISTRY[node.type].outputs : []
-  const accent = STATUS_COLORS[status]
-  const emphasised = selected || status === 'error' || status === 'warning'
+  const emphasised = status === 'error' || status === 'warning'
+  const headerColor =
+    status === 'error'
+      ? '#f85149'
+      : status === 'warning'
+        ? '#d29922'
+        : categoryColor(category)
   return h.g(
-    [h.Transform(`translate(${node.position.x},${node.position.y})`)],
+    [
+      h.Transform(`translate(${node.position.x},${node.position.y})`),
+      h.Class('node-card'),
+    ],
     [
       h.rect([
         h.X('0'),
         h.Y('0'),
         h.Width(String(NODE_W)),
         h.Height(String(height)),
-        h.Rx('8'),
-        h.Fill('#161b22'),
-        h.Stroke(accent),
-        h.StrokeWidth(emphasised ? '2' : '1'),
+        h.Rx('10'),
+        h.Fill('#12151c'),
+        h.Stroke(
+          status === 'error'
+            ? '#f85149'
+            : status === 'warning'
+              ? '#d29922'
+              : '#272e3a',
+        ),
+        h.StrokeWidth(emphasised ? '1.5' : '1'),
         h.OnClick(Message.SelectedNode({ nodeId: node.id })),
       ]),
       selected
         ? h.rect([
-            h.X('-3'),
-            h.Y('-3'),
-            h.Width(String(NODE_W + 6)),
-            h.Height(String(height + 6)),
-            h.Rx('11'),
+            h.X('-4'),
+            h.Y('-4'),
+            h.Width(String(NODE_W + 8)),
+            h.Height(String(height + 8)),
+            h.Rx('13'),
             h.Fill('none'),
-            h.Stroke('#58a6ff'),
+            h.Stroke(HIGHLIGHT_COLOR),
             h.StrokeWidth('2'),
           ])
         : highlighted
           ? h.rect([
-              h.X('-3'),
-              h.Y('-3'),
-              h.Width(String(NODE_W + 6)),
-              h.Height(String(height + 6)),
-              h.Rx('11'),
+              h.X('-4'),
+              h.Y('-4'),
+              h.Width(String(NODE_W + 8)),
+              h.Height(String(height + 8)),
+              h.Rx('13'),
               h.Fill('none'),
               h.Stroke(HIGHLIGHT_COLOR),
               h.StrokeWidth('2'),
@@ -1543,8 +2278,9 @@ function nodeView(
         h.Y('0'),
         h.Width(String(NODE_W)),
         h.Height(String(HEADER_H)),
-        h.Rx('8'),
-        h.Fill(statusHeaderFill(status)),
+        h.Rx('10'),
+        h.Fill(headerColor),
+        h.FillOpacity(status === 'initial' ? '0.14' : '0.24'),
         h.Cursor('grab'),
         h.OnPointerDown((_t, button, sx, sy) =>
           button === 0
@@ -1554,9 +2290,37 @@ function nodeView(
             : Option.none(),
         ),
       ]),
+      h.rect([
+        h.X('1'),
+        h.Y(String(HEADER_H - 2)),
+        h.Width(String(NODE_W - 2)),
+        h.Height('2'),
+        h.Fill(headerColor),
+        h.FillOpacity('0.55'),
+        h.PointerEvents('none'),
+      ]),
       h.text(
-        [h.X('10'), h.Y('20'), h.Fill('#f0f6fc'), h.FontSize('13')],
-        [`${label} · ${node.id}`],
+        [
+          h.X('11'),
+          h.Y('20'),
+          h.Fill('#f0f6fc'),
+          h.FontSize('12.5'),
+          h.FontWeight('600'),
+          h.PointerEvents('none'),
+        ],
+        [label],
+      ),
+      h.text(
+        [
+          h.X(String(NODE_W - 11)),
+          h.Y('19.5'),
+          h.Fill('#77839a'),
+          h.FontSize('10'),
+          h.FontFamily('ui-monospace, monospace'),
+          h.TextAnchor('end'),
+          h.PointerEvents('none'),
+        ],
+        [node.id],
       ),
       ...inputs.flatMap((port, i) => {
         const y = portY(node.type, i)
@@ -1565,9 +2329,9 @@ function nodeView(
           h.circle([
             h.Cx('0'),
             h.Cy(String(y)),
-            h.R(armed ? '8' : '6'),
+            h.R(armed ? '8.5' : '6.5'),
             h.Fill(typeColor(port.valueType)),
-            h.Stroke('#0d1117'),
+            h.Stroke('#0a0c10'),
             h.StrokeWidth('2'),
             h.Cursor('pointer'),
             h.Class('graph-port graph-port-in'),
@@ -1610,15 +2374,35 @@ function nodeView(
           ]),
           h.text(
             [
-              h.X('14'),
+              h.X('15'),
               h.Y(String(y + 4)),
-              h.Fill('#8b949e'),
-              h.FontSize('12'),
+              h.Fill('#97a3b4'),
+              h.FontSize('11'),
+              h.PointerEvents('none'),
             ],
             [port.name],
           ),
         ]
       }),
+      ...(node.type === 'Float'
+        ? [
+            h.text(
+              [
+                h.X('15'),
+                h.Y(String(portY(node.type, 0) + 4)),
+                h.Fill('#cdd6e4'),
+                h.FontSize('11'),
+                h.FontFamily('ui-monospace, monospace'),
+                h.PointerEvents('none'),
+              ],
+              [
+                String(
+                  typeof node.params.value === 'number' ? node.params.value : 0,
+                ),
+              ],
+            ),
+          ]
+        : []),
       ...outputs.flatMap((port, i) => {
         const y = portY(node.type, i)
         const isArmed =
@@ -1628,20 +2412,21 @@ function nodeView(
         return [
           h.text(
             [
-              h.X(String(NODE_W - 14)),
+              h.X(String(NODE_W - 15)),
               h.Y(String(y + 4)),
-              h.Fill('#8b949e'),
-              h.FontSize('12'),
+              h.Fill('#97a3b4'),
+              h.FontSize('11'),
               h.TextAnchor('end'),
+              h.PointerEvents('none'),
             ],
             [port.name],
           ),
           h.circle([
             h.Cx(String(NODE_W)),
             h.Cy(String(y)),
-            h.R(isArmed ? '9' : '6'),
+            h.R(isArmed ? '9.5' : '6.5'),
             h.Fill(typeColor(port.valueType)),
-            h.Stroke(isArmed ? '#ffffff' : '#0d1117'),
+            h.Stroke(isArmed ? '#ffffff' : '#0a0c10'),
             h.StrokeWidth('2'),
             h.Cursor('pointer'),
             h.Class('graph-port graph-port-out'),
@@ -1707,9 +2492,16 @@ function inspectorView(
   }
   const selected = model.nodes.find(n => n.id === model.selectedNodeIds[0])
   return h.div(
-    [h.Class('border-b border-neutral-800 p-3 max-h-64 overflow-auto')],
+    [h.Class('px-4 py-3.5 border-b border-[#161c26] max-h-64 overflow-auto')],
     [
-      h.div([h.Class('font-semibold text-neutral-100 mb-2')], ['Inspector']),
+      h.div(
+        [
+          h.Class(
+            'text-[11px] font-semibold uppercase tracking-[0.14em] text-neutral-500 mb-3',
+          ),
+        ],
+        ['Inspector'],
+      ),
       selected === undefined
         ? h.div(
             [h.Class('text-neutral-500')],
@@ -1749,7 +2541,7 @@ function rerouteInspector(
                 Message.RenamedReroute({ declarationId: node.id, name }),
               ),
               h.Class(
-                'w-full bg-neutral-800 border border-neutral-700 rounded px-2 py-1 text-neutral-100',
+                'w-full bg-[#12151c] border border-[#232a36] rounded-md px-2.5 py-1.5 text-[12.5px] text-neutral-100 focus:outline-none focus:border-sky-500/50 transition-colors',
               ),
               h.AriaLabel('Reroute name'),
             ]),
@@ -1785,7 +2577,9 @@ function rerouteInspector(
         h.button(
           [
             h.OnClick(Message.RequestedDeleteSelection()),
-            h.Class('bg-red-900 hover:bg-red-800 text-white rounded px-3 py-1'),
+            h.Class(
+              'bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 text-red-300 rounded-md px-3 py-1.5 transition-colors',
+            ),
           ],
           ['Delete node'],
         ),
@@ -1823,7 +2617,9 @@ function rerouteInspector(
         h.button(
           [
             h.OnClick(Message.RequestedDeleteSelection()),
-            h.Class('bg-red-900 hover:bg-red-800 text-white rounded px-3 py-1'),
+            h.Class(
+              'bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 text-red-300 rounded-md px-3 py-1.5 transition-colors',
+            ),
           ],
           ['Delete node'],
         ),
@@ -1857,10 +2653,14 @@ function collapsedInspector(
   entry: CollapsedNode,
 ): ReturnType<HtmlBuilder<Message>['div']> {
   return h.div(
-    [h.Class('border-b border-neutral-800 p-3 max-h-64 overflow-auto')],
+    [h.Class('px-4 py-3.5 border-b border-[#161c26] max-h-64 overflow-auto')],
     [
       h.div(
-        [h.Class('font-semibold text-neutral-100 mb-2')],
+        [
+          h.Class(
+            'text-[11px] font-semibold uppercase tracking-[0.14em] text-neutral-500 mb-3',
+          ),
+        ],
         ['Collapsed Nodes'],
       ),
       h.div(
@@ -1877,7 +2677,7 @@ function collapsedInspector(
                   Message.RenamedCollapsed({ collapsedId: entry.id, name }),
                 ),
                 h.Class(
-                  'w-full bg-neutral-800 border border-neutral-700 rounded px-2 py-1 text-neutral-100',
+                  'w-full bg-[#12151c] border border-[#232a36] rounded-md px-2.5 py-1.5 text-[12.5px] text-neutral-100 focus:outline-none focus:border-sky-500/50 transition-colors',
                 ),
                 h.AriaLabel('Collapsed name'),
               ]),
@@ -1900,7 +2700,7 @@ function collapsedInspector(
             [
               h.OnClick(Message.RequestedDeleteSelection()),
               h.Class(
-                'bg-red-900 hover:bg-red-800 text-white rounded px-3 py-1',
+                'bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 text-red-300 rounded-md px-3 py-1.5 transition-colors',
               ),
             ],
             ['Delete container'],
@@ -1916,9 +2716,16 @@ function groupInspector(
   group: Group,
 ): ReturnType<HtmlBuilder<Message>['div']> {
   return h.div(
-    [h.Class('border-b border-neutral-800 p-3 max-h-64 overflow-auto')],
+    [h.Class('px-4 py-3.5 border-b border-[#161c26] max-h-64 overflow-auto')],
     [
-      h.div([h.Class('font-semibold text-neutral-100 mb-2')], ['Group']),
+      h.div(
+        [
+          h.Class(
+            'text-[11px] font-semibold uppercase tracking-[0.14em] text-neutral-500 mb-3',
+          ),
+        ],
+        ['Group'],
+      ),
       h.div(
         [h.Class('flex flex-col gap-3')],
         [
@@ -1933,7 +2740,7 @@ function groupInspector(
                   Message.RenamedGroup({ groupId: group.id, name }),
                 ),
                 h.Class(
-                  'w-full bg-neutral-800 border border-neutral-700 rounded px-2 py-1 text-neutral-100',
+                  'w-full bg-[#12151c] border border-[#232a36] rounded-md px-2.5 py-1.5 text-[12.5px] text-neutral-100 focus:outline-none focus:border-sky-500/50 transition-colors',
                 ),
                 h.AriaLabel('Group name'),
               ]),
@@ -1965,6 +2772,17 @@ function groupInspector(
               ),
             ],
           ),
+          h.button(
+            [
+              h.OnClick(Message.OpenedGroupColorPicker({ groupId: group.id })),
+              h.Class(
+                'self-start text-[11.5px] text-sky-300 hover:bg-sky-500/10 border border-transparent rounded-md px-2 py-0.5 transition-colors',
+              ),
+              h.AriaLabel(`Open custom color picker for ${group.name}`),
+              h.Title('Pick any color'),
+            ],
+            ['Custom…'],
+          ),
           h.div(
             [h.Class('text-neutral-500 text-xs')],
             [
@@ -1975,7 +2793,7 @@ function groupInspector(
             [
               h.OnClick(Message.PressedUngroupSelection()),
               h.Class(
-                'bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-3 py-1',
+                'bg-[#1a2029] hover:bg-[#232b37] border border-[#2a3240] rounded-md px-3 py-1.5 text-[12.5px] text-neutral-200 transition-colors',
               ),
               h.AriaLabel('Ungroup group'),
             ],
@@ -2023,7 +2841,7 @@ function inspectorFor(
                 }),
               ),
               h.Class(
-                'w-full bg-neutral-800 border border-neutral-700 rounded px-2 py-1 text-neutral-100',
+                'w-full bg-[#12151c] border border-[#232a36] rounded-md px-2.5 py-1.5 text-[12.5px] text-neutral-100 focus:outline-none focus:border-sky-500/50 transition-colors',
               ),
               h.AriaLabel(`${node.id} ${key}`),
             ]),
@@ -2040,7 +2858,7 @@ function inspectorFor(
         [
           h.OnClick(Message.RequestedDeleteSelection()),
           h.Class(
-            'bg-red-900 hover:bg-red-800 text-white rounded px-3 py-1 mt-1',
+            'bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 text-red-300 rounded-md px-3 py-1.5 mt-1 transition-colors',
           ),
         ],
         ['Delete node'],
@@ -2055,39 +2873,70 @@ function hlslView(
   result: ReturnType<typeof generate>,
 ): ReturnType<HtmlBuilder<Message>['div']> {
   return h.div(
-    [h.Class('border-b border-neutral-800 p-3 flex flex-col min-h-0')],
+    [h.Class('px-4 py-3.5 border-b border-[#161c26] flex flex-col min-h-0')],
     [
       h.div(
-        [h.Class('flex items-center mb-2')],
+        [h.Class('flex items-center mb-3')],
         [
           h.span(
-            [h.Class('font-semibold text-neutral-100')],
+            [
+              h.Class(
+                'text-[11px] font-semibold uppercase tracking-[0.14em] text-neutral-500',
+              ),
+            ],
             ['Generated HLSL'],
           ),
           h.button(
             [
               h.OnClick(Message.RequestedCopyHlsl()),
               h.Class(
-                'ml-auto bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded px-2 py-1',
+                'ml-auto text-[11.5px] text-neutral-400 hover:text-neutral-100 hover:bg-neutral-800/80 border border-transparent rounded-md px-2 py-0.5 transition-colors',
               ),
+              h.AriaLabel('Copy HLSL'),
+              h.Title('Copy generated HLSL'),
             ],
             ['Copy'],
           ),
         ],
       ),
       result.ok
-        ? h.pre(
+        ? h.div(
             [
               h.Class(
-                'bg-black rounded p-2 overflow-auto text-xs font-mono text-green-300 whitespace-pre-wrap',
+                'rounded-xl border border-[#1c2230] overflow-hidden bg-[#0a0c10]',
               ),
             ],
-            [result.code],
+            [
+              h.div(
+                [
+                  h.Class(
+                    'flex items-center gap-1.5 px-3 py-2 bg-[#12151c] border-b border-[#1c2230]',
+                  ),
+                ],
+                [
+                  h.span([h.Class('w-2 h-2 rounded-full bg-[#ff5f57]')]),
+                  h.span([h.Class('w-2 h-2 rounded-full bg-[#febc2e]')]),
+                  h.span([h.Class('w-2 h-2 rounded-full bg-[#28c840]')]),
+                  h.span(
+                    [h.Class('ml-1.5 text-[10px] font-mono text-neutral-500')],
+                    ['fragment.hlsl'],
+                  ),
+                ],
+              ),
+              h.pre(
+                [
+                  h.Class(
+                    'p-3 overflow-auto text-[11.5px] leading-relaxed font-mono text-emerald-300/90 whitespace-pre-wrap',
+                  ),
+                ],
+                [result.code],
+              ),
+            ],
           )
         : h.div(
             [
               h.Class(
-                'bg-red-950 border border-red-800 rounded p-2 text-red-200',
+                'bg-red-500/10 border border-red-500/25 rounded-lg p-3 text-[12.5px] text-red-300',
               ),
             ],
             ['Graph is invalid. Fix the problems below.'],
@@ -2102,26 +2951,42 @@ function problemsView(
   errors: ReturnType<typeof validate>,
 ): ReturnType<HtmlBuilder<Message>['div']> {
   return h.div(
-    [h.Class('p-3 flex-1 overflow-auto min-h-0')],
+    [h.Class('px-4 py-3.5 flex-1 overflow-auto min-h-0')],
     [
       h.div(
-        [h.Class('font-semibold text-neutral-100 mb-2')],
+        [
+          h.Class(
+            'text-[11px] font-semibold uppercase tracking-[0.14em] text-neutral-500 mb-3',
+          ),
+        ],
         [`Problems (${errors.length})`],
       ),
       errors.length === 0
-        ? h.div([h.Class('text-neutral-500')], ['No problems.'])
+        ? h.div([h.Class('text-[12px] text-neutral-600')], ['No problems.'])
         : h.div(
-            [h.Class('flex flex-col gap-1')],
+            [h.Class('flex flex-col gap-1.5')],
             errors.map(error =>
               h.div(
-                [h.Class('bg-neutral-800 rounded px-2 py-1')],
+                [
+                  h.Class(
+                    'bg-[#12151c] border border-[#232a36] rounded-md px-2.5 py-2 flex items-start gap-2',
+                  ),
+                ],
                 [
                   h.span(
-                    [h.Class('text-red-400 font-mono text-xs mr-2')],
+                    [
+                      h.Class(
+                        'text-[9.5px] font-mono px-1.5 py-0.5 rounded bg-red-500/10 text-red-300 border border-red-500/25 shrink-0 mt-0.5',
+                      ),
+                    ],
                     [error.code],
                   ),
                   h.span(
-                    [h.Class('text-neutral-300 whitespace-pre-line')],
+                    [
+                      h.Class(
+                        'text-[12px] text-neutral-300 whitespace-pre-line flex-1',
+                      ),
+                    ],
                     [error.message],
                   ),
                   error.nodeId !== undefined
@@ -2130,7 +2995,9 @@ function problemsView(
                           h.OnClick(
                             Message.SelectedNode({ nodeId: error.nodeId }),
                           ),
-                          h.Class('ml-2 text-sky-400 hover:text-sky-300'),
+                          h.Class(
+                            'shrink-0 mt-0.5 text-[10.5px] font-mono text-sky-400 hover:text-sky-300 bg-sky-500/10 border border-sky-500/25 rounded px-1.5 py-0.5 transition-colors',
+                          ),
                         ],
                         [`${error.nodeId}`],
                       )
@@ -2153,13 +3020,20 @@ function statusView(
   return h.div(
     [
       h.Class(
-        'flex items-center gap-3 px-3 py-1.5 border-t border-neutral-800 bg-neutral-900 text-xs text-neutral-400',
+        'h-9 shrink-0 flex items-center gap-2.5 px-4 border-t border-[#1c2230] bg-[#0e1116] text-[11.5px] text-neutral-400',
       ),
     ],
     [
+      h.span([
+        h.Class(
+          pending === ''
+            ? 'w-1.5 h-1.5 rounded-full bg-emerald-400/80'
+            : 'w-1.5 h-1.5 rounded-full bg-sky-400 animate-pulse',
+        ),
+      ]),
       h.span([h.Class('truncate')], [pending === '' ? 'Ready.' : pending]),
       h.span(
-        [h.Class('ml-auto shrink-0')],
+        [h.Class('ml-auto shrink-0 text-neutral-600')],
         [
           'Del delete · Ctrl+G group · Ctrl+C/V copy · right-click canvas to add',
         ],

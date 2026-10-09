@@ -5,11 +5,12 @@ import { Option, Predicate } from 'effect'
 import { type Update } from 'foldkit'
 import { modifyFields } from 'foldkit/struct'
 
-import { generate, upstreamPortType } from '@hlsl-editor/shader-compiler'
+import { evaluateGraph, generate, upstreamPortType } from '@hlsl-editor/shader-compiler'
 import { NODE_REGISTRY, isNodeType } from '@hlsl-editor/shader-nodes'
 import { canConnect, connectionErrorMessage } from '@hlsl-editor/shader-types'
 
 import { hiddenNodeIds } from './collapse'
+import { isValidGroupColor, normalizeHexColor } from './color-picker'
 import {
   CopyHlsl,
   DownloadJson,
@@ -19,7 +20,7 @@ import {
   PersistSettings,
   PickImportFile,
 } from './commands'
-import { DEFAULT_GROUP_COLOR, GROUP_COLORS } from './groups'
+import { DEFAULT_GROUP_COLOR } from './groups'
 import {
   REROUTE_SIZE,
   ZOOM_STEP,
@@ -34,6 +35,7 @@ import {
   type EditorEdge,
   type EditorNode,
   type Group,
+  type LogEntry,
   type Model,
   emptyModel,
   fromSerialized,
@@ -65,6 +67,19 @@ type UpdateReturn = Update.Return<Model, Message>
 
 function withStatus(model: Model, status: string): Model {
   return modifyFields(model, { status: () => status })
+}
+
+// Logs a session-console entry (newest first, capped) and mirrors it into
+// the status bar. Levels: error, warning, success, info, system.
+const LOG_CAP = 200
+
+function withLog(model: Model, level: LogEntry['level'], text: string): Model {
+  const entry: LogEntry = { id: model.nextLogId, level, text }
+  return modifyFields(model, {
+    status: () => text,
+    logs: () => [entry, ...model.logs].slice(0, LOG_CAP),
+    nextLogId: () => model.nextLogId + 1,
+  })
 }
 
 interface DecodedNode {
@@ -291,27 +306,33 @@ function parseGraphText(text: string):
 function applyImported(model: Model, text: string, pushUndo: boolean): Model {
   const parsed = parseGraphText(text)
   if (!parsed.ok) {
-    return withStatus(model, parsed.reason)
+    return withLog(model, 'error', parsed.reason)
   }
   const restored = fromSerialized(parsed.data)
   const base = pushUndo ? pushHistory(model) : model
-  return modifyFields(base, {
-    nodes: () => restored.nodes,
-    edges: () => restored.edges,
-    groups: () => [],
-    collapsed: () => restored.collapsed,
-    nextCollapsed: () => restored.nextCollapsed,
-    rerouteNames: () => restored.rerouteNames,
-    outputNodeId: () => restored.outputNodeId,
-    nextNode: () => restored.nextNode,
-    nextEdge: () => restored.nextEdge,
-    nextGroup: () => 1,
-    selectedNodeIds: () => [],
-    selectedGroupId: () => Option.none(),
-    selectedCollapsedId: () => Option.none(),
-    pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
-    status: () => `Imported graph with ${restored.nodes.length} nodes.`,
-  })
+  return modifyFields(
+    withLog(
+      base,
+      'success',
+      `Imported graph with ${restored.nodes.length} nodes.`,
+    ),
+    {
+      nodes: () => restored.nodes,
+      edges: () => restored.edges,
+      groups: () => [],
+      collapsed: () => restored.collapsed,
+      nextCollapsed: () => restored.nextCollapsed,
+      rerouteNames: () => restored.rerouteNames,
+      outputNodeId: () => restored.outputNodeId,
+      nextNode: () => restored.nextNode,
+      nextEdge: () => restored.nextEdge,
+      nextGroup: () => 1,
+      selectedNodeIds: () => [],
+      selectedGroupId: () => Option.none(),
+      selectedCollapsedId: () => Option.none(),
+      pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
+    },
+  )
 }
 
 // Removes the selected nodes, edge, or group in one history entry.
@@ -357,7 +378,7 @@ function deleteSelection(model: Model): Model {
   const outputId = Option.getOrNull(model.outputNodeId)
   const outputGone = outputId !== null && gone.has(outputId)
   const base = pushHistory(model)
-  const status =
+  const message =
     nodeIds.length > 0
       ? `Deleted ${nodeIds.length} node${nodeIds.length === 1 ? '' : 's'}.`
       : groupId !== null
@@ -365,19 +386,18 @@ function deleteSelection(model: Model): Model {
         : collapsedId !== null
           ? `Deleted ${collapsedId}.`
           : `Deleted edge ${edgeId ?? ''}.`
-  return modifyFields(base, {
+  return modifyFields(withLog(base, 'info', message), {
     nodes: () => nodes,
     edges: () => edges,
     groups: () => groups,
     collapsed: () => collapsed,
     rerouteNames: () => rerouteNames,
-    outputNodeId: () => (outputGone ? Option.none() : model.outputNodeId),
+    outputNodeId: () => (outputGone ? Option.none() : base.outputNodeId),
     selectedNodeIds: () => [],
     selectedEdgeId: () => Option.none(),
     selectedGroupId: () => Option.none(),
     selectedCollapsedId: () => Option.none(),
     pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
-    status: () => status,
   })
 }
 
@@ -387,6 +407,10 @@ function closeContextMenu(model: Model): Model {
 
 function dismissNodeMenu(model: Model): Model {
   return modifyFields(model, { nodeMenu: () => Option.none() })
+}
+
+function dismissColorPicker(model: Model): Model {
+  return modifyFields(model, { colorPicker: () => Option.none() })
 }
 
 // Cancels an in-flight wire and closes the add-node menu. Escape routes here
@@ -453,11 +477,12 @@ function ungroupSelected(model: Model): Model {
 // the type and the single-Fragment-Output rule, then inserts and selects it.
 function addNodeAt(model: Model, type: string, x: number, y: number): Model {
   if (!isNodeType(type)) {
-    return withStatus(model, `Unknown node type: ${type}.`)
+    return withLog(model, 'error', `Unknown node type: ${type}.`)
   }
   if (type === 'FragmentOutput' && Option.isSome(model.outputNodeId)) {
-    return withStatus(
+    return withLog(
       model,
+      'error',
       'There is already a Fragment Output. Only one is allowed.',
     )
   }
@@ -469,14 +494,16 @@ function addNodeAt(model: Model, type: string, x: number, y: number): Model {
     params: { ...NODE_REGISTRY[type].defaultParams },
   }
   const base = pushHistory(model)
-  return modifyFields(base, {
-    nodes: () => [...model.nodes, node],
-    outputNodeId: () =>
-      type === 'FragmentOutput' ? Option.some(id) : model.outputNodeId,
-    nextNode: () => model.nextNode + 1,
-    selectedNodeIds: () => [id],
-    status: () => `Added ${type} (${id}).`,
-  })
+  return modifyFields(
+    withLog(base, 'info', `Added ${type} (${id}).`),
+    {
+      nodes: () => [...base.nodes, node],
+      outputNodeId: () =>
+        type === 'FragmentOutput' ? Option.some(id) : base.outputNodeId,
+      nextNode: () => base.nextNode + 1,
+      selectedNodeIds: () => [id],
+    },
+  )
 }
 
 function attemptConnect(
@@ -490,7 +517,7 @@ function attemptConnect(
   const sourceNode = graph.nodes.find(n => n.id === fromNodeId)
   const targetNode = graph.nodes.find(n => n.id === toNodeId)
   if (sourceNode === undefined || targetNode === undefined) {
-    return withStatus(model, 'Cannot connect: node not found.')
+    return withLog(model, 'error', 'Cannot connect: node not found.')
   }
   const sourcePortDef = sourceNode.ports.find(
     p => p.name === fromPort && p.direction === 'out',
@@ -499,34 +526,38 @@ function attemptConnect(
     p => p.name === toPort && p.direction === 'in',
   )
   if (sourcePortDef === undefined) {
-    return withStatus(
+    return withLog(
       model,
+      'error',
       `Cannot connect: ${fromNodeId}.${fromPort} is not an output port. Start from an output (right side).`,
     )
   }
   if (targetPortDef === undefined) {
-    return withStatus(
+    return withLog(
       model,
+      'error',
       `Cannot connect: ${toNodeId}.${toPort} is not an input port. End on an input (left side).`,
     )
   }
   if (fromNodeId === toNodeId) {
-    return withStatus(model, 'Cannot connect a node to itself.')
+    return withLog(model, 'error', 'Cannot connect a node to itself.')
   }
   if (
     model.edges.some(
       e => e.targetNodeId === toNodeId && e.targetPort === toPort,
     )
   ) {
-    return withStatus(
+    return withLog(
       model,
+      'error',
       `Input ${toNodeId}.${toPort} is already connected. Disconnect it first.`,
     )
   }
   const sourceType = upstreamPortType(graph, fromNodeId, fromPort)
   if (sourceType === null) {
-    return withStatus(
+    return withLog(
       model,
+      'error',
       'Cannot connect: source type is not ready yet. Connect its inputs first.',
     )
   }
@@ -541,7 +572,7 @@ function attemptConnect(
   if (!ok) {
     const single = allowed.length === 1 ? allowed[0] : undefined
     const expected = single !== undefined ? single : allowed.join(' | ')
-    return withStatus(model, connectionErrorMessage(expected, sourceType))
+    return withLog(model, 'error', connectionErrorMessage(expected, sourceType))
   }
   const edge: EditorEdge = {
     id: `e${model.nextEdge}`,
@@ -551,12 +582,10 @@ function attemptConnect(
     targetPort: toPort,
   }
   const base = pushHistory(model)
-  return modifyFields(base, {
-    edges: () => [...model.edges, edge],
-    nextEdge: () => model.nextEdge + 1,
+  return modifyFields(withLog(base, 'success', `Connected ${fromNodeId}.${fromPort} to ${toNodeId}.${toPort}.`), {
+    edges: () => [...base.edges, edge],
+    nextEdge: () => base.nextEdge + 1,
     pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
-    status: () =>
-      `Connected ${fromNodeId}.${fromPort} to ${toNodeId}.${toPort}.`,
   })
 }
 
@@ -1652,7 +1681,11 @@ export const update = (model: Model, message: Message): UpdateReturn =>
               recordingAction: () => Option.none(),
             }),
           }
-        : { model: cancelPending(model) },
+        : Option.isSome(model.play)
+          ? { model: modifyFields(model, { play: () => Option.none() }) }
+          : Option.isSome(model.colorPicker)
+            ? { model: dismissColorPicker(model) }
+            : { model: cancelPending(model) },
     PressedSettings: () => ({
       model: modifyFields(model, {
         settingsOpen: () => !model.settingsOpen,
@@ -1886,7 +1919,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       }
     },
     ChangedGroupColor: ({ groupId, color }) => {
-      if (!GROUP_COLORS.includes(color)) {
+      if (!isValidGroupColor(color)) {
         return { model }
       }
       if (model.groups.every(group => group.id !== groupId)) {
@@ -1901,6 +1934,54 @@ export const update = (model: Model, message: Message): UpdateReturn =>
         }),
       }
     },
+    OpenedGroupColorPicker: ({ groupId }) => {
+      const group = model.groups.find(g => g.id === groupId)
+      if (group === undefined) {
+        return { model }
+      }
+      return {
+        model: modifyFields(model, {
+          colorPicker: () =>
+            Option.some({
+              groupId: group.id,
+              originalColor: group.color,
+              draft: group.color,
+            }),
+        }),
+      }
+    },
+    EditedGroupColorDraft: ({ text }) => ({
+      model: modifyFields(model, {
+        colorPicker: () =>
+          Option.map(model.colorPicker, picker => ({
+            groupId: picker.groupId,
+            originalColor: picker.originalColor,
+            draft: text,
+          })),
+      }),
+    }),
+    AppliedGroupColorDraft: () => {
+      const picker = Option.getOrNull(model.colorPicker)
+      if (picker === null) {
+        return { model }
+      }
+      const color = normalizeHexColor(picker.draft)
+      if (color === null || model.groups.every(g => g.id !== picker.groupId)) {
+        return { model }
+      }
+      return {
+        model: modifyFields(model, {
+          groups: () =>
+            model.groups.map(group =>
+              group.id === picker.groupId ? { ...group, color } : group,
+            ),
+          colorPicker: () => Option.none(),
+        }),
+      }
+    },
+    CancelledGroupColorPicker: () => ({
+      model: dismissColorPicker(model),
+    }),
     ToggledMinimap: () => ({
       model: modifyFields(model, {
         minimapVisible: () => !model.minimapVisible,
@@ -1955,7 +2036,7 @@ export const update = (model: Model, message: Message): UpdateReturn =>
     UpdatedParam: ({ nodeId, key, valueText }) => {
       const value = Number.parseFloat(valueText)
       if (!Number.isFinite(value)) {
-        return { model: withStatus(model, `Invalid number: "${valueText}".`) }
+        return { model: withLog(model, 'warning', `Invalid number: "${valueText}".`) }
       }
       const node = model.nodes.find(n => n.id === nodeId)
       if (node === undefined || node.params[key] === undefined) {
@@ -1966,14 +2047,13 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       }
       const base = pushHistory(model)
       return {
-        model: modifyFields(base, {
+        model: modifyFields(withLog(base, 'info', `Set ${nodeId}.${key} to ${value}.`), {
           nodes: () =>
-            model.nodes.map(n =>
+            base.nodes.map(n =>
               n.id === nodeId
                 ? { ...n, params: { ...n.params, [key]: value } }
                 : n,
             ),
-          status: () => `Set ${nodeId}.${key} to ${value}.`,
         }),
       }
     },
@@ -2153,74 +2233,98 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       return { model, commands: [PersistGraph({ json })] }
     },
     CompletedPersistGraph: () => ({
-      model: withStatus(model, 'Saved to browser storage.'),
+      model: withLog(model, 'system', 'Saved to browser storage.'),
     }),
     FailedPersistGraph: ({ reason }) => ({
-      model: withStatus(model, `Save failed: ${reason}`),
+      model: withLog(model, 'error', `Save failed: ${reason}`),
     }),
     CompletedLoadGraph: ({ json }) => {
       const parsed = parseGraphText(json)
       if (!parsed.ok) {
         return {
-          model: withStatus(model, `Stored graph is invalid: ${parsed.reason}`),
+          model: withLog(
+            model,
+            'error',
+            `Stored graph is invalid: ${parsed.reason}`,
+          ),
         }
       }
       const restored = fromSerialized(parsed.data)
       return {
-        model: modifyFields(model, {
-          nodes: () => restored.nodes,
-          edges: () => restored.edges,
-          groups: () => [],
-          collapsed: () => restored.collapsed,
-          nextCollapsed: () => restored.nextCollapsed,
-          rerouteNames: () => restored.rerouteNames,
-          outputNodeId: () => restored.outputNodeId,
-          nextNode: () => restored.nextNode,
-          nextEdge: () => restored.nextEdge,
-          nextGroup: () => 1,
-          selectedNodeIds: () => [],
-          selectedGroupId: () => Option.none(),
-          selectedCollapsedId: () => Option.none(),
-          status: () =>
+        model: modifyFields(
+          withLog(
+            model,
+            'system',
             `Loaded saved graph with ${restored.nodes.length} nodes.`,
-        }),
+          ),
+          {
+            nodes: () => restored.nodes,
+            edges: () => restored.edges,
+            groups: () => [],
+            collapsed: () => restored.collapsed,
+            nextCollapsed: () => restored.nextCollapsed,
+            rerouteNames: () => restored.rerouteNames,
+            outputNodeId: () => restored.outputNodeId,
+            nextNode: () => restored.nextNode,
+            nextEdge: () => restored.nextEdge,
+            nextGroup: () => 1,
+            selectedNodeIds: () => [],
+            selectedGroupId: () => Option.none(),
+            selectedCollapsedId: () => Option.none(),
+          },
+        ),
       }
     },
     CompletedLoadEmpty: () => ({
-      model: modifyFields(seedModel(), {
-        shortcutPlatform: () => model.shortcutPlatform,
-        keymap: () => model.keymap,
-      }),
+      model: modifyFields(
+        withLog(seedModel(), 'system', 'No saved graph. Demo graph loaded.'),
+        {
+          shortcutPlatform: () => model.shortcutPlatform,
+          keymap: () => model.keymap,
+        },
+      ),
     }),
     FailedLoadGraph: ({ reason }) => ({
-      model: withStatus(
+      model: withLog(
         modifyFields(seedModel(), {
           shortcutPlatform: () => model.shortcutPlatform,
           keymap: () => model.keymap,
         }),
+        'warning',
         `Could not read saved graph (${reason}). Showing demo graph.`,
       ),
     }),
     RequestedNew: () => {
       const base = pushHistory(model)
+      // A fresh graph starts valid: it always contains the one Fragment
+      // Output that HLSL generation requires.
       return {
-        model: modifyFields(base, {
-          nodes: () => [],
-          edges: () => [],
-          groups: () => [],
-          collapsed: () => [],
-          nextCollapsed: () => 1,
-          rerouteNames: () => ({}),
-          outputNodeId: () => Option.none(),
-          nextNode: () => 1,
-          nextEdge: () => 1,
-          nextGroup: () => 1,
-          selectedNodeIds: () => [],
-          selectedGroupId: () => Option.none(),
-          selectedCollapsedId: () => Option.none(),
-          pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
-          status: () => 'New graph. Add nodes from the palette.',
-        }),
+        model: modifyFields(
+          withLog(base, 'system', 'New graph. Add nodes from the palette.'),
+          {
+            nodes: () => [
+              {
+                id: 'n1',
+                type: 'FragmentOutput',
+                position: { x: 1020, y: 450 },
+                params: { ...NODE_REGISTRY['FragmentOutput'].defaultParams },
+              },
+            ],
+            edges: () => [],
+            groups: () => [],
+            collapsed: () => [],
+            nextCollapsed: () => 1,
+            rerouteNames: () => ({}),
+            outputNodeId: () => Option.some('n1'),
+            nextNode: () => 2,
+            nextEdge: () => 1,
+            nextGroup: () => 1,
+            selectedNodeIds: () => [],
+            selectedGroupId: () => Option.none(),
+            selectedCollapsedId: () => Option.none(),
+            pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
+          },
+        ),
       }
     },
     RequestedExport: () => {
@@ -2252,15 +2356,16 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       model: withStatus(model, 'Import cancelled.'),
     }),
     FailedImportFile: ({ reason }) => ({
-      model: withStatus(model, `Import failed: ${reason}`),
+      model: withLog(model, 'error', `Import failed: ${reason}`),
     }),
     RequestedCopyHlsl: () => {
       const result = generate(toDomainGraph(model))
       if (!result.ok) {
         const first = result.errors[0]
         return {
-          model: withStatus(
+          model: withLog(
             model,
+            'error',
             `Cannot copy: ${first !== undefined ? first.message : 'graph is invalid.'}`,
           ),
         }
@@ -2268,10 +2373,47 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       return { model, commands: [CopyHlsl({ code: result.code })] }
     },
     CompletedCopyHlsl: () => ({
-      model: withStatus(model, 'HLSL copied to clipboard.'),
+      model: withLog(model, 'system', 'HLSL copied to clipboard.'),
     }),
     FailedCopyHlsl: ({ reason }) => ({
-      model: withStatus(model, `Copy failed: ${reason}`),
+      model: withLog(model, 'error', `Copy failed: ${reason}`),
+    }),
+    RequestedPlay: () => {
+      const result = evaluateGraph(toDomainGraph(model))
+      if (!result.ok) {
+        return {
+          model: withLog(
+            model,
+            'error',
+            `Cannot play: fix ${result.errors.length} problem${result.errors.length === 1 ? '' : 's'} first.`,
+          ),
+        }
+      }
+      const [r, g, b, a] = result.color
+      const fmt = (v: number): string =>
+        Number.isFinite(v) ? String(Number(v.toFixed(4))) : String(v)
+      return {
+        model: modifyFields(
+          withLog(
+            model,
+            'success',
+            `Playing preview. Output = float4(${fmt(r)}, ${fmt(g)}, ${fmt(b)}, ${fmt(a)}).`,
+          ),
+          {
+            play: () => Option.some({ color: result.color }),
+            status: () => 'Playing preview. Edit the graph to stop.',
+          },
+        ),
+      }
+    },
+    DismissedPlay: () => ({
+      model: modifyFields(model, { play: () => Option.none() }),
+    }),
+    ToggledLogPanel: () => ({
+      model: modifyFields(model, { logPanelOpen: () => !model.logPanelOpen }),
+    }),
+    PressedClearLogs: () => ({
+      model: modifyFields(model, { logs: () => [] }),
     }),
     DismissedStatus: () => ({ model: withStatus(model, '') }),
   })
