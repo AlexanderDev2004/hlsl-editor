@@ -5,7 +5,11 @@ import { Option, Schema } from 'effect'
 import { modifyFields } from 'foldkit/struct'
 
 import type { Graph } from '@hlsl-editor/graph'
-import { NODE_REGISTRY, createNodeOfType, isNodeType } from '@hlsl-editor/shader-nodes'
+import {
+  NODE_REGISTRY,
+  createNodeOfType,
+  isNodeType,
+} from '@hlsl-editor/shader-nodes'
 
 import { DEFAULT_KEYMAP } from './shortcuts'
 
@@ -497,7 +501,12 @@ export function fromSerialized(data: {
 > {
   const nodes: Array<EditorNode> = data.nodes
     .filter(n => isNodeType(n.type))
-    .map(n => ({ id: n.id, type: n.type, position: { ...n.position }, params: sanitizeParams(n.type, n.params) }))
+    .map(n => ({
+      id: n.id,
+      type: n.type,
+      position: { ...n.position },
+      params: sanitizeParams(n.type, n.params),
+    }))
   const edges: Array<EditorEdge> = data.edges.map(e => ({
     id: e.id,
     sourceNodeId: e.source.nodeId,

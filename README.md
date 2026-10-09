@@ -145,6 +145,21 @@ Connections are made by clicking an output port then an input port.
 `float -> floatN` inserts a splat constructor; `floatN -> float` is rejected
 (use Split). Invalid graphs produce structured errors and no HLSL.
 
+Texture and scene nodes extend the set per the HLSL/D3D sampling docs:
+Sample Texture 2D (Type Default/Normal unpacks a tangent-space normal map;
+Space Shader/Linear applies the sRGB transfer via an emitted `srgbToLinear`
+helper), Sample Cubemap (`TextureCube.Sample` on a normalized direction),
+Dot Product (`dot(a, b)`, operands must have equal length), Normal Vector
+(uniform `_NormalVector`, Space World/Object through `(float3x3) _WorldToObject`),
+Main Light Direction (uniform `_MainLightDirection`, normalized) and Camera
+(per-port `_CameraPosition` / `normalize(_CameraDirection)` references).
+The emitter declares only the textures/samplers/uniforms the reachable graph
+uses, named after each node's variable. Sample nodes read GPU data and scene
+inputs read engine-bound data, so the CPU-side Play/Preview evaluation reports
+them as unevaluable instead of inventing values. Preview is a debug passthrough
+that materializes its input into a named variable (inspectable in RenderDoc/
+PIX) and shows the value as a live UNORM-clamped swatch on the card.
+
 Reroute nodes (plain and named) are organizing constructs that are transparent
 to the compiler: the emitter assigns them no variable and resolves consumers
 straight to the upstream expression, so the generated HLSL is byte-identical to
@@ -155,7 +170,9 @@ work unchanged.
 ## 11. MVP 1
 
 - Nodes: Float, Float2, Float3, Float4, Add, Subtract, Multiply, Divide,
-  Split, Combine, Reroute, Fragment Output.
+  Dot Product, Split, Combine, Reroute, Fragment Output, Preview,
+  Sample Texture 2D, Sample Cubemap, Normal Vector, Main Light Direction,
+  Camera.
 - Canvas: create, move (drag), delete, connect, select, zoom (slider/reset),
   pan (middle-drag). Left-drag on empty canvas draws a marquee that selects
   every node it overlaps. Ports are color-coded by type; invalid edges and

@@ -270,7 +270,9 @@ describe('editor view', () => {
       expect(text('Session console ready.')).toExist(),
       expect(text('1 error')).toExist(),
       click(role('button', { name: 'Clear log panel' })),
-      expect(text('No entries yet. Connect nodes or edit the graph.')).toExist(),
+      expect(
+        text('No entries yet. Connect nodes or edit the graph.'),
+      ).toExist(),
       click(role('button', { name: 'Close log panel' })),
       expect(selector('.log-panel')).toBeAbsent(),
       click(role('button', { name: 'Toggle log panel' })),
@@ -315,6 +317,85 @@ describe('editor view', () => {
       pointerDown(selector('.graph-port-out'), { clientX: 100, clientY: 140 }),
       pointerUp(selector('.graph-port-in')),
       expect(text('Connected n1.out to n3.a.')).toExist(),
+    )
+  })
+})
+
+describe('texture and scene nodes', () => {
+  test('a Preview node renders a swatch band on its card', () => {
+    scene(
+      { update, view },
+      given(seedModel()),
+      pointerDown(selector('.graph-canvas'), {
+        button: 2,
+        clientX: 300,
+        clientY: 200,
+      }),
+      type(role('textbox', { name: 'Search nodes to add' }), 'prev'),
+      click(role('button', { name: 'Add Preview' })),
+      expect(selector('.node-preview')).toExist(),
+      // Unconnected previews state that instead of inventing a color.
+      expect(selector('[aria-label="n5 preview unavailable"]')).toExist(),
+    )
+  })
+
+  test('a connected Preview swatch shows the value flowing through', () => {
+    // Preview sits between n1 and the Multiply so it feeds the output.
+    scene(
+      { update, view },
+      given({
+        ...seedModel(),
+        nodes: [
+          ...seedModel().nodes,
+          {
+            id: 'n5',
+            type: 'Preview',
+            position: { x: 620, y: 300 },
+            params: {},
+          },
+        ],
+        edges: [
+          ...seedModel().edges.filter(e => e.id !== 'e1'),
+          {
+            id: 'e9',
+            sourceNodeId: 'n1',
+            sourcePort: 'out',
+            targetNodeId: 'n5',
+            targetPort: 'in',
+          },
+          {
+            id: 'e10',
+            sourceNodeId: 'n5',
+            sourcePort: 'out',
+            targetNodeId: 'n3',
+            targetPort: 'a',
+          },
+        ],
+        nextNode: 6,
+      }),
+      expect(selector('[aria-label="n5 preview swatch"]')).toExist(),
+    )
+  })
+
+  test('Sample Texture 2D shows Type and Space dropdowns in the Inspector', () => {
+    scene(
+      { update, view },
+      given({
+        ...seedModel(),
+        nodes: [
+          ...seedModel().nodes,
+          {
+            id: 'n5',
+            type: 'SampleTexture2D',
+            position: { x: 100, y: 100 },
+            params: { Type: 0, Space: 0 },
+          },
+        ],
+        selectedNodeIds: ['n5'],
+      }),
+      expect(text('SampleTexture2D (n5)')).toExist(),
+      expect(role('combobox', { name: 'n5 Type' })).toExist(),
+      expect(role('combobox', { name: 'n5 Space' })).toExist(),
     )
   })
 })

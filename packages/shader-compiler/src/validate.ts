@@ -2,7 +2,9 @@ import { detectCycle, incomingEdge, type Graph } from "@hlsl-editor/graph";
 import { NODE_REGISTRY, isNodeType, resolveOutputType } from "@hlsl-editor/shader-nodes";
 import {
   canConnect,
+  componentCount,
   connectionErrorMessage,
+  describeType,
   isMvp1Type,
   type HlslType,
 } from "@hlsl-editor/shader-types";
@@ -131,6 +133,30 @@ export function validate(graph: Graph): Array<CompilerError> {
         );
       }
     }
+    // dot(x, y) requires both operands to have the same number of
+    // components (HLSL docs: the operands must be the same size). Types
+    // resolve through the operand edges' SOURCE ports.
+    if (node.type === "DotProduct") {
+      const edgeA = incomingEdge(graph, node.id, "a");
+      const edgeB = incomingEdge(graph, node.id, "b");
+      const a =
+        edgeA !== undefined
+          ? upstreamPortType(graph, edgeA.source.nodeId, edgeA.source.port)
+          : null;
+      const b =
+        edgeB !== undefined
+          ? upstreamPortType(graph, edgeB.source.nodeId, edgeB.source.port)
+          : null;
+      if (a !== null && b !== null && componentCount(a) !== componentCount(b)) {
+        errors.push(
+          err(
+            "TypeMismatch",
+            `Dot Product requires inputs of equal length (got ${describeType(a)} and ${describeType(b)}).`,
+            node.id,
+          ),
+        );
+      }
+    }
   }
 
   return errors;
@@ -182,6 +208,31 @@ export function upstreamPortType(
   }
   if (node.type === "Split") {
     return "float";
+  }
+  if (node.type === "Preview") {
+    return inputActualType(graph, nodeId, "in", seen);
+  }
+  if (node.type === "DotProduct") {
+    const a = inputActualType(graph, nodeId, "a", seen);
+    const b = inputActualType(graph, nodeId, "b", seen);
+    if (a === null || b === null) {
+      return null;
+    }
+    return resolveOutputType(node.type, { a, b });
+  }
+  if (
+    node.type === "SampleTexture2D" ||
+    node.type === "SampleCubemap" ||
+    node.type === "NormalVector" ||
+    node.type === "MainLightDirection" ||
+    node.type === "Camera"
+  ) {
+    // R/G/B/A are scalar component reads off the float4 sample variable;
+    // only the RGBA port carries the full vector.
+    if (node.type === "SampleTexture2D" || node.type === "SampleCubemap") {
+      return portName === "RGBA" ? "float4" : "float";
+    }
+    return resolveOutputType(node.type, {});
   }
   if (
     node.type === "Reroute" ||

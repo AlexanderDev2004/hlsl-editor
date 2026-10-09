@@ -3,7 +3,12 @@
 
 import type { Graph } from "@hlsl-editor/graph";
 import { incomingEdge } from "@hlsl-editor/graph";
-import { isNodeType, isRerouteType, type NodeType } from "@hlsl-editor/shader-nodes";
+import {
+  isNodeType,
+  isRerouteType,
+  resolveOutputType,
+  type NodeType,
+} from "@hlsl-editor/shader-nodes";
 import type { HlslType } from "@hlsl-editor/shader-types";
 
 import { upstreamPortType } from "./validate";
@@ -87,9 +92,9 @@ export function toIR(graph: Graph): GraphIR {
     if (node === undefined || !isNodeType(node.type)) {
       continue;
     }
-    // Transparent nodes (reroutes, the output) emit no variable, so the
-    // numbering downstream matches a graph without them.
-    if (node.type === "FragmentOutput" || isRerouteType(node.type)) {
+    // Transparent nodes (reroutes, the camera, the output) emit no
+    // variable, so the numbering downstream matches a graph without them.
+    if (node.type === "FragmentOutput" || node.type === "Camera" || isRerouteType(node.type)) {
       continue;
     }
     varOf.set(id, `_${counter}`);
@@ -141,11 +146,21 @@ function inputPortNames(type: NodeType): Array<string> {
     case "Subtract":
     case "Multiply":
     case "Divide":
+    case "DotProduct":
       return ["a", "b"];
     case "Split":
+    case "Preview":
       return ["in"];
     case "Combine":
       return ["x", "y", "z", "w"];
+    case "SampleTexture2D":
+      return ["UV"];
+    case "SampleCubemap":
+      return ["Dir"];
+    case "NormalVector":
+    case "MainLightDirection":
+    case "Camera":
+      return [];
     case "Reroute":
     case "NamedRerouteDeclaration":
     case "NamedRerouteUsage":
@@ -173,9 +188,9 @@ function resolveNodeOutType(graph: Graph, nodeId: string): HlslType {
   if (node.type === "Float4") {
     return "float4";
   }
-  // Split aliases the input vector; its variable keeps the vector type
-  // so downstream port reads emit swizzles off it.
-  if (node.type === "Split") {
+  // Split/Preview alias the input vector; the variable keeps the vector
+  // type so downstream port reads emit swizzles off it.
+  if (node.type === "Split" || node.type === "Preview") {
     const edge = incomingEdge(graph, nodeId, "in");
     if (edge === undefined) {
       throw new Error(`Cannot resolve output type for ${nodeId}`);
@@ -185,6 +200,22 @@ function resolveNodeOutType(graph: Graph, nodeId: string): HlslType {
       throw new Error(`Cannot resolve output type for ${nodeId}`);
     }
     return t;
+  }
+  // Sample nodes expose RGBA/R/G/B/A off one float4; scene inputs are
+  // float3; Camera is transparent (per-port uniform references).
+  if (
+    node.type === "DotProduct" ||
+    node.type === "SampleTexture2D" ||
+    node.type === "SampleCubemap" ||
+    node.type === "NormalVector" ||
+    node.type === "MainLightDirection" ||
+    node.type === "Camera"
+  ) {
+    const resolved = resolveOutputType(node.type, {});
+    if (resolved === null) {
+      throw new Error(`Cannot resolve output type for ${nodeId}`);
+    }
+    return resolved;
   }
   const t = upstreamPortType(graph, nodeId, "out");
   if (t === null) {

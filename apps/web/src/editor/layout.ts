@@ -44,7 +44,9 @@ export function nodeHeight(type: string): number {
   }
   const def = NODE_REGISTRY[type]
   const rows = Math.max(def.inputs.length, def.outputs.length, 1)
-  return HEADER_H + rows * ROW_H + PAD * 2
+  // Preview cards grow an extra band under the ports for the live swatch.
+  const previewBand = type === 'Preview' ? 46 : 0
+  return HEADER_H + rows * ROW_H + PAD * 2 + previewBand
 }
 
 export function portY(type: string, index: number): number {

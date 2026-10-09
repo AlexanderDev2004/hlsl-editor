@@ -4,7 +4,8 @@
 import { Option } from 'effect'
 import { type Document, type Html, type HtmlBuilder } from 'foldkit/html'
 
-import { generate, validate } from '@hlsl-editor/shader-compiler'
+import { type Graph } from '@hlsl-editor/graph'
+import { evaluateNode, generate, validate } from '@hlsl-editor/shader-compiler'
 import {
   NODE_REGISTRY,
   NODE_TYPES,
@@ -29,7 +30,9 @@ import {
   BASE_W,
   HEADER_H,
   NODE_W,
+  PAD,
   REROUTE_SIZE,
+  ROW_H,
   ZOOM_MAX,
   ZOOM_MIN,
   nodeHeight,
@@ -141,6 +144,7 @@ const CATEGORY_COLORS: Record<string, string> = {
   Math: '#34d399',
   Vector: '#fbbf24',
   Utility: '#a78bfa',
+  Texture: '#22d3ee',
   Output: '#fb7185',
 }
 
@@ -323,7 +327,7 @@ export const view = (model: Model, h: HtmlBuilder<Message>): Document => {
         h.div(
           [h.Class('flex-1 flex min-h-0')],
           [
-            canvasView(model, h, errorPorts, nodeStatuses),
+            canvasView(model, h, graph, errorPorts, nodeStatuses),
             h.div(
               [
                 h.Class(
@@ -630,7 +634,13 @@ function playPreviewView(model: Model, h: HtmlBuilder<Message>): Html {
   const channel = (v: number): string => byte(v).toString(16).padStart(2, '0')
   const hex = `#${channel(r)}${channel(g)}${channel(b)}`
   const raw = (v: number): string =>
-    Number.isFinite(v) ? v.toFixed(4) : v > 0 ? '∞' : Number.isNaN(v) ? 'NaN' : '-∞'
+    Number.isFinite(v)
+      ? v.toFixed(4)
+      : v > 0
+        ? '∞'
+        : Number.isNaN(v)
+          ? 'NaN'
+          : '-∞'
   const rows: Array<readonly [string, number]> = [
     ['R', r],
     ['G', g],
@@ -658,9 +668,10 @@ function playPreviewView(model: Model, h: HtmlBuilder<Message>): Html {
                 [h.Class('text-[13.5px] font-semibold text-neutral-100')],
                 ['▶ Play preview'],
               ),
-              h.span([h.Class('text-[11px] text-neutral-500')], [
-                'SV_Target output',
-              ]),
+              h.span(
+                [h.Class('text-[11px] text-neutral-500')],
+                ['SV_Target output'],
+              ),
               h.button(
                 [
                   h.OnClick(Message.DismissedPlay()),
@@ -681,14 +692,12 @@ function playPreviewView(model: Model, h: HtmlBuilder<Message>): Html {
               ),
             ],
             [
-              h.div(
-                [
-                  h.Class('h-36 w-full'),
-                  h.Style({
-                    backgroundColor: `rgba(${byte(r)}, ${byte(g)}, ${byte(b)}, ${clamp01(a)})`,
-                  }),
-                ],
-              ),
+              h.div([
+                h.Class('h-36 w-full'),
+                h.Style({
+                  backgroundColor: `rgba(${byte(r)}, ${byte(g)}, ${byte(b)}, ${clamp01(a)})`,
+                }),
+              ]),
             ],
           ),
           h.div(
@@ -833,13 +842,11 @@ function logPanelView(model: Model, h: HtmlBuilder<Message>): Html {
             h.div(
               [h.Class('flex items-start gap-2 font-mono text-[11.5px]')],
               [
-                h.span(
-                  [
-                    h.Class(
-                      `mt-[5px] w-1.5 h-1.5 rounded-full shrink-0 ${LOG_LEVEL_DOT[entry.level]}`,
-                    ),
-                  ],
-                ),
+                h.span([
+                  h.Class(
+                    `mt-[5px] w-1.5 h-1.5 rounded-full shrink-0 ${LOG_LEVEL_DOT[entry.level]}`,
+                  ),
+                ]),
                 h.span(
                   [
                     h.Class(
@@ -1334,6 +1341,7 @@ function searchView(
 function canvasView(
   model: Model,
   h: HtmlBuilder<Message>,
+  graph: Graph,
   errorPorts: Set<string>,
   nodeStatuses: ReadonlyMap<string, NodeStatus>,
 ): ReturnType<HtmlBuilder<Message>['div']> {
@@ -1745,6 +1753,7 @@ function canvasView(
                   nodeView(
                     model,
                     h,
+                    graph,
                     node,
                     nodeStatuses.get(node.id) ?? 'initial',
                     highlightedNodes.has(node.id),
@@ -2201,6 +2210,7 @@ function rerouteNodeView(
 function nodeView(
   model: Model,
   h: HtmlBuilder<Message>,
+  graph: Graph,
   node: EditorNode,
   status: NodeStatus,
   highlighted: boolean,
@@ -2469,9 +2479,53 @@ function nodeView(
           ]),
         ]
       }),
+      node.type === 'Preview' ? previewSwatch(graph, h, node) : h.empty,
       nodeStatusIndicator(h, status, model.loadingVariant, NODE_W, height),
     ],
   )
+}
+
+// Live swatch for Preview nodes: the numeric value flowing through the
+// card, clamped to [0,1] like an 8-bit UNORM target (scalars render as
+// grayscale; float2/3/4 map onto RGB(A) with alpha defaulting to 1).
+// Scene/GPU-dependent values and broken graphs get an explicit
+// "unavailable" state instead of an invented color.
+function previewSwatch(
+  graph: Graph,
+  h: HtmlBuilder<Message>,
+  node: EditorNode,
+): Html {
+  const y = HEADER_H + PAD + ROW_H + 6
+  const geometry = [
+    h.X('9'),
+    h.Y(String(y)),
+    h.Width(String(NODE_W - 18)),
+    h.Height('36'),
+    h.Rx('5'),
+    h.Class('node-preview'),
+    h.PointerEvents('none'),
+  ]
+  const result = evaluateNode(graph, node.id)
+  if (!result.ok) {
+    return h.rect([
+      ...geometry,
+      h.Fill('#0a0c10'),
+      h.Stroke('#f85149'),
+      h.StrokeDasharray('4 3'),
+      h.AriaLabel(`${node.id} preview unavailable`),
+    ])
+  }
+  const v = result.value
+  const byte = (x: number | undefined): number =>
+    Math.round(Math.min(1, Math.max(0, x ?? 0)) * 255)
+  const alpha = v.length >= 4 ? Math.min(1, Math.max(0, v[3] ?? 0)) : 1
+  const fill = `rgba(${byte(v[0])}, ${byte(v.length >= 2 ? v[1] : v[0])}, ${byte(v.length >= 3 ? v[2] : 0)}, ${alpha})`
+  return h.rect([
+    ...geometry,
+    h.Fill(fill),
+    h.Stroke('#272e3a'),
+    h.AriaLabel(`${node.id} preview swatch`),
+  ])
 }
 
 function inspectorView(
@@ -2805,50 +2859,96 @@ function groupInspector(
   )
 }
 
+const PARAM_INPUT_CLASS =
+  'w-full bg-[#12151c] border border-[#232a36] rounded-md px-2.5 py-1.5 text-[12.5px] text-neutral-100 focus:outline-none focus:border-sky-500/50 transition-colors'
+
 function inspectorFor(
   h: HtmlBuilder<Message>,
   node: EditorNode,
 ): ReturnType<HtmlBuilder<Message>['div']> {
+  const def = isNodeType(node.type) ? NODE_REGISTRY[node.type] : undefined
+  const paramDefs = def !== undefined ? def.paramDefs : undefined
+  // Nodes with paramDefs (enum dropdowns like Sample Texture 2D's Type and
+  // Space) render from the registry; the Float family keeps its fixed
+  // numeric key rows.
   const keys =
-    node.type === 'Float'
-      ? ['value']
-      : node.type === 'Float2'
-        ? ['x', 'y']
-        : node.type === 'Float3'
-          ? ['x', 'y', 'z']
-          : node.type === 'Float4'
-            ? ['x', 'y', 'z', 'w']
-            : []
+    paramDefs !== undefined
+      ? []
+      : node.type === 'Float'
+        ? ['value']
+        : node.type === 'Float2'
+          ? ['x', 'y']
+          : node.type === 'Float3'
+            ? ['x', 'y', 'z']
+            : node.type === 'Float4'
+              ? ['x', 'y', 'z', 'w']
+              : []
+  const enumRow = (pDef: {
+    key: string
+    label: string
+    options: ReadonlyArray<{ value: number; label: string }>
+  }) => {
+    const raw = node.params[pDef.key]
+    const current = typeof raw === 'number' ? raw : 0
+    return h.label(
+      [h.Class('flex items-center gap-2')],
+      [
+        h.span([h.Class('w-16 text-neutral-400')], [pDef.label]),
+        h.select(
+          [
+            h.OnChange(value =>
+              Message.UpdatedParam({
+                nodeId: node.id,
+                key: pDef.key,
+                valueText: value,
+              }),
+            ),
+            h.Value(String(current)),
+            h.Class(PARAM_INPUT_CLASS + ' cursor-pointer'),
+            h.AriaLabel(`${node.id} ${pDef.key}`),
+          ],
+          pDef.options.map(option =>
+            h.option([h.Value(String(option.value))], [option.label]),
+          ),
+        ),
+      ],
+    )
+  }
+  const numberRow = (key: string, labelWidth = 'w-12') => {
+    const raw = node.params[key]
+    const current = typeof raw === 'number' ? raw : 0
+    return h.label(
+      [h.Class('flex items-center gap-2')],
+      [
+        h.span([h.Class(`${labelWidth} text-neutral-400`)], [key]),
+        h.input([
+          h.Type('number'),
+          h.Value(String(current)),
+          h.OnInput(value =>
+            Message.UpdatedParam({
+              nodeId: node.id,
+              key,
+              valueText: value,
+            }),
+          ),
+          h.Class(PARAM_INPUT_CLASS),
+          h.AriaLabel(`${node.id} ${key}`),
+        ]),
+      ],
+    )
+  }
+  const rows =
+    paramDefs !== undefined
+      ? paramDefs.map(pDef =>
+          pDef.kind === 'enum' ? enumRow(pDef) : numberRow(pDef.key, 'w-16'),
+        )
+      : keys.map(key => numberRow(key))
   return h.div(
     [h.Class('flex flex-col gap-2')],
     [
       h.div([h.Class('text-neutral-400')], [`${node.type} (${node.id})`]),
-      ...keys.map(key => {
-        const raw = node.params[key]
-        const current = typeof raw === 'number' ? raw : 0
-        return h.label(
-          [h.Class('flex items-center gap-2')],
-          [
-            h.span([h.Class('w-12 text-neutral-400')], [key]),
-            h.input([
-              h.Type('number'),
-              h.Value(String(current)),
-              h.OnInput(value =>
-                Message.UpdatedParam({
-                  nodeId: node.id,
-                  key,
-                  valueText: value,
-                }),
-              ),
-              h.Class(
-                'w-full bg-[#12151c] border border-[#232a36] rounded-md px-2.5 py-1.5 text-[12.5px] text-neutral-100 focus:outline-none focus:border-sky-500/50 transition-colors',
-              ),
-              h.AriaLabel(`${node.id} ${key}`),
-            ]),
-          ],
-        )
-      }),
-      keys.length === 0
+      ...rows,
+      rows.length === 0
         ? h.div(
             [h.Class('text-neutral-500')],
             ['No editable values. Connect its ports.'],

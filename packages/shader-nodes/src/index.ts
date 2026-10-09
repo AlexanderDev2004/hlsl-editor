@@ -14,12 +14,19 @@ export const NODE_TYPES = [
   "Subtract",
   "Multiply",
   "Divide",
+  "DotProduct",
   "Split",
   "Combine",
   "Reroute",
   "NamedRerouteDeclaration",
   "NamedRerouteUsage",
   "FragmentOutput",
+  "Preview",
+  "SampleTexture2D",
+  "SampleCubemap",
+  "NormalVector",
+  "MainLightDirection",
+  "Camera",
 ] as const;
 export type NodeType = (typeof NODE_TYPES)[number];
 
@@ -31,13 +38,30 @@ export interface PortDef {
   accepts?: ReadonlyArray<HlslType>;
 }
 
+// Inspector metadata. `number` params render as numeric inputs; `enum`
+// params render as dropdowns whose option values are stored as numbers.
+export interface EnumOption {
+  readonly value: number;
+  readonly label: string;
+}
+
+export type ParamDef =
+  | { readonly key: string; readonly label: string; readonly kind: "number" }
+  | {
+      readonly key: string;
+      readonly label: string;
+      readonly kind: "enum";
+      readonly options: ReadonlyArray<EnumOption>;
+    };
+
 export interface NodeDefinition {
   type: NodeType;
   label: string;
-  category: "Input" | "Math" | "Vector" | "Utility" | "Output";
+  category: "Input" | "Math" | "Vector" | "Utility" | "Texture" | "Output";
   inputs: Array<PortDef>;
   outputs: Array<PortDef>;
   defaultParams: Record<string, number | Array<number>>;
+  paramDefs?: ReadonlyArray<ParamDef>;
 }
 
 function port(nodeId: string, def: PortDef): Port {
@@ -145,6 +169,128 @@ export const NODE_REGISTRY: Record<NodeType, NodeDefinition> = {
     category: "Math",
     inputs: MATH_INPUTS,
     outputs: [{ name: "out", direction: "out", valueType: "float", required: false }],
+    defaultParams: {},
+  },
+  // HLSL dot(): inner product of two vectors of equal length. Scalar dot
+  // equals plain multiplication; mixed lengths are rejected by validation.
+  DotProduct: {
+    type: "DotProduct",
+    label: "Dot Product",
+    category: "Math",
+    inputs: MATH_INPUTS,
+    outputs: [{ name: "out", direction: "out", valueType: "float", required: false }],
+    defaultParams: {},
+  },
+  // Debug passthrough (one input, one output) that also shows a live color
+  // swatch on the card, mirroring the numeric value flowing through it.
+  Preview: {
+    type: "Preview",
+    label: "Preview",
+    category: "Utility",
+    inputs: ANY_INPUT,
+    outputs: PASSTHROUGH_OUTPUT,
+    defaultParams: {},
+  },
+  // Per D3D/HLSL sampling docs: Texture2D.Sample(sampler, uv). Type=Normal
+  // unpacks a tangent-space normal map (*2-1, normalized); Space=Linear
+  // converts the sampled sRGB color to linear light.
+  SampleTexture2D: {
+    type: "SampleTexture2D",
+    label: "Sample Texture 2D",
+    category: "Texture",
+    inputs: [{ name: "UV", direction: "in", valueType: "float2", required: true }],
+    outputs: [
+      { name: "RGBA", direction: "out", valueType: "float4", required: false },
+      { name: "R", direction: "out", valueType: "float", required: false },
+      { name: "G", direction: "out", valueType: "float", required: false },
+      { name: "B", direction: "out", valueType: "float", required: false },
+      { name: "A", direction: "out", valueType: "float", required: false },
+    ],
+    defaultParams: { Type: 0, Space: 0 },
+    paramDefs: [
+      {
+        key: "Type",
+        label: "Type",
+        kind: "enum",
+        options: [
+          { value: 0, label: "Default" },
+          { value: 1, label: "Normal" },
+        ],
+      },
+      {
+        key: "Space",
+        label: "Space",
+        kind: "enum",
+        options: [
+          { value: 0, label: "Shader" },
+          { value: 1, label: "Linear" },
+        ],
+      },
+    ],
+  },
+  // Per D3D/HLSL docs, TextureCube.Sample takes a direction vector; the
+  // emitted code normalizes it explicitly for numerical stability.
+  SampleCubemap: {
+    type: "SampleCubemap",
+    label: "Sample Cubemap",
+    category: "Texture",
+    inputs: [
+      {
+        name: "Dir",
+        direction: "in",
+        valueType: "float3",
+        required: true,
+        accepts: ["float3", "float4"],
+      },
+    ],
+    outputs: [
+      { name: "RGBA", direction: "out", valueType: "float4", required: false },
+      { name: "R", direction: "out", valueType: "float", required: false },
+      { name: "G", direction: "out", valueType: "float", required: false },
+      { name: "B", direction: "out", valueType: "float", required: false },
+      { name: "A", direction: "out", valueType: "float", required: false },
+    ],
+    defaultParams: {},
+  },
+  // Scene/geometry inputs cannot exist inside a standalone pixel shader, so
+  // the emitter declares external uniforms the host engine binds per frame
+  // (the same pattern Unity URP uses for _MainLightDirection & co).
+  NormalVector: {
+    type: "NormalVector",
+    label: "Normal Vector",
+    category: "Input",
+    inputs: [],
+    outputs: [{ name: "out", direction: "out", valueType: "float3", required: false }],
+    defaultParams: { Space: 1 },
+    paramDefs: [
+      {
+        key: "Space",
+        label: "Space",
+        kind: "enum",
+        options: [
+          { value: 0, label: "Object" },
+          { value: 1, label: "World" },
+        ],
+      },
+    ],
+  },
+  MainLightDirection: {
+    type: "MainLightDirection",
+    label: "Main Light Direction",
+    category: "Input",
+    inputs: [],
+    outputs: [{ name: "out", direction: "out", valueType: "float3", required: false }],
+    defaultParams: {},
+  },
+  Camera: {
+    type: "Camera",
+    label: "Camera",
+    category: "Input",
+    inputs: [],
+    outputs: [
+      { name: "Position", direction: "out", valueType: "float3", required: false },
+      { name: "Direction", direction: "out", valueType: "float3", required: false },
+    ],
     defaultParams: {},
   },
   Split: {
@@ -289,6 +435,19 @@ export function resolveOutputType(
       }
       return "float2";
     }
+    case "DotProduct":
+      // dot() always reduces to a scalar.
+      return "float";
+    case "Preview":
+      return inputTypes["in"] ?? null;
+    case "SampleTexture2D":
+    case "SampleCubemap":
+      // Primary RGBA output; R/G/B/A read off the same float4 variable.
+      return "float4";
+    case "NormalVector":
+    case "MainLightDirection":
+    case "Camera":
+      return "float3";
     case "Reroute":
     case "NamedRerouteDeclaration":
     case "NamedRerouteUsage":

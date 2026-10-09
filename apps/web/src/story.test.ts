@@ -179,7 +179,9 @@ describe('editor update', () => {
     story(
       update,
       given(seedModel()),
-      message(Message.UpdatedParam({ nodeId: 'n1', key: 'value', valueText: 'abc' })),
+      message(
+        Message.UpdatedParam({ nodeId: 'n1', key: 'value', valueText: 'abc' }),
+      ),
       Command.expectNone(),
       model((m: Model) => {
         expect(m.logs[0]?.level).toBe('warning')
@@ -1649,6 +1651,31 @@ describe('editor update', () => {
         expect(m.edges[0]?.targetNodeId).toBe('n2')
         expect(m.edges[0]?.targetPort).toBe('a')
         expect(m.status).toContain('Connected n1.out to n2.a')
+      }),
+    )
+  })
+})
+
+describe('texture and scene nodes', () => {
+  test('Sample Texture 2D enum params commit from the inspector values', () => {
+    story(
+      update,
+      given(seedModel()),
+      message(Message.ChangedNewNodeType({ nodeType: 'SampleTexture2D' })),
+      message(Message.RequestedAddNode({ x: 120, y: 120 })),
+      message(
+        Message.UpdatedParam({ nodeId: 'n5', key: 'Space', valueText: '1' }),
+      ),
+      message(
+        Message.UpdatedParam({ nodeId: 'n5', key: 'Type', valueText: '1' }),
+      ),
+      Command.expectNone(),
+      model((m: Model) => {
+        const sample = m.nodes.find(n => n.id === 'n5')
+        expect(sample?.params['Space']).toBe(1)
+        expect(sample?.params['Type']).toBe(1)
+        expect(m.logs[0]?.level).toBe('info')
+        expect(m.logs[0]?.text).toContain('Set n5.Type to 1')
       }),
     )
   })

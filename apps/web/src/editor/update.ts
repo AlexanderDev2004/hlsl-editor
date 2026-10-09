@@ -5,7 +5,11 @@ import { Option, Predicate } from 'effect'
 import { type Update } from 'foldkit'
 import { modifyFields } from 'foldkit/struct'
 
-import { evaluateGraph, generate, upstreamPortType } from '@hlsl-editor/shader-compiler'
+import {
+  evaluateGraph,
+  generate,
+  upstreamPortType,
+} from '@hlsl-editor/shader-compiler'
 import { NODE_REGISTRY, isNodeType } from '@hlsl-editor/shader-nodes'
 import { canConnect, connectionErrorMessage } from '@hlsl-editor/shader-types'
 
@@ -494,16 +498,13 @@ function addNodeAt(model: Model, type: string, x: number, y: number): Model {
     params: { ...NODE_REGISTRY[type].defaultParams },
   }
   const base = pushHistory(model)
-  return modifyFields(
-    withLog(base, 'info', `Added ${type} (${id}).`),
-    {
-      nodes: () => [...base.nodes, node],
-      outputNodeId: () =>
-        type === 'FragmentOutput' ? Option.some(id) : base.outputNodeId,
-      nextNode: () => base.nextNode + 1,
-      selectedNodeIds: () => [id],
-    },
-  )
+  return modifyFields(withLog(base, 'info', `Added ${type} (${id}).`), {
+    nodes: () => [...base.nodes, node],
+    outputNodeId: () =>
+      type === 'FragmentOutput' ? Option.some(id) : base.outputNodeId,
+    nextNode: () => base.nextNode + 1,
+    selectedNodeIds: () => [id],
+  })
 }
 
 function attemptConnect(
@@ -582,11 +583,18 @@ function attemptConnect(
     targetPort: toPort,
   }
   const base = pushHistory(model)
-  return modifyFields(withLog(base, 'success', `Connected ${fromNodeId}.${fromPort} to ${toNodeId}.${toPort}.`), {
-    edges: () => [...base.edges, edge],
-    nextEdge: () => base.nextEdge + 1,
-    pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
-  })
+  return modifyFields(
+    withLog(
+      base,
+      'success',
+      `Connected ${fromNodeId}.${fromPort} to ${toNodeId}.${toPort}.`,
+    ),
+    {
+      edges: () => [...base.edges, edge],
+      nextEdge: () => base.nextEdge + 1,
+      pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
+    },
+  )
 }
 
 // Direction of a named port on a node, or null when the node or port is
@@ -2036,7 +2044,9 @@ export const update = (model: Model, message: Message): UpdateReturn =>
     UpdatedParam: ({ nodeId, key, valueText }) => {
       const value = Number.parseFloat(valueText)
       if (!Number.isFinite(value)) {
-        return { model: withLog(model, 'warning', `Invalid number: "${valueText}".`) }
+        return {
+          model: withLog(model, 'warning', `Invalid number: "${valueText}".`),
+        }
       }
       const node = model.nodes.find(n => n.id === nodeId)
       if (node === undefined || node.params[key] === undefined) {
@@ -2047,14 +2057,17 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       }
       const base = pushHistory(model)
       return {
-        model: modifyFields(withLog(base, 'info', `Set ${nodeId}.${key} to ${value}.`), {
-          nodes: () =>
-            base.nodes.map(n =>
-              n.id === nodeId
-                ? { ...n, params: { ...n.params, [key]: value } }
-                : n,
-            ),
-        }),
+        model: modifyFields(
+          withLog(base, 'info', `Set ${nodeId}.${key} to ${value}.`),
+          {
+            nodes: () =>
+              base.nodes.map(n =>
+                n.id === nodeId
+                  ? { ...n, params: { ...n.params, [key]: value } }
+                  : n,
+              ),
+          },
+        ),
       }
     },
     RequestedDeleteSelection: () => ({

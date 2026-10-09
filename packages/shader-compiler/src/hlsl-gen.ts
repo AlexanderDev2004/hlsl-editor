@@ -17,6 +17,31 @@ function numParam(value: number | Array<number> | undefined, fallback: number): 
   return typeof value === "number" ? value : fallback;
 }
 
+// Texture/sampler naming follows the HLSL "sampler_" + texture-name pairing
+// convention so the default sampler binds by name in effect-style setups.
+function texName(node: IRNode): string {
+  return `Tex${node.variable.slice(1)}`;
+}
+
+function samplerName(node: IRNode): string {
+  return `sampler_${texName(node)}`;
+}
+
+function enumParam(node: IRNode, key: string, fallback: number): number {
+  return numParam(node.params[key], fallback);
+}
+
+// The sRGB→linear transfer used when a 2D sample's Space is Linear, per the
+// sRGB standard (c <= 0.04045 ? c/12.92 : ((c+0.055)/1.055)^2.4). The HLSL
+// ternary applies per component when the condition is a vector.
+const SRGB_TO_LINEAR = [
+  "float3 srgbToLinear(float3 c)",
+  "{",
+  "    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);",
+  "}",
+  "",
+].join("\n");
+
 function exprFor(ir: GraphIR, node: IRNode): string {
   switch (node.op) {
     case "Float":
@@ -52,9 +77,63 @@ function exprFor(ir: GraphIR, node: IRNode): string {
       const bExpr = withSplat(portRef(ir, b.fromNodeId, b.fromPort), b.fromType, node.outType);
       return `${aExpr} ${MATH_OP[node.op] as string} ${bExpr}`;
     }
+    case "DotProduct": {
+      // Validation guarantees equal component counts, so no splat is
+      // applied: dot(a, b) maps 1:1 onto the HLSL intrinsic.
+      const a = node.inputs["a"];
+      const b = node.inputs["b"];
+      if (a === undefined || b === undefined) {
+        throw new Error(`Missing inputs for ${node.id}`);
+      }
+      return `dot(${portRef(ir, a.fromNodeId, a.fromPort)}, ${portRef(ir, b.fromNodeId, b.fromPort)})`;
+    }
+    case "SampleTexture2D": {
+      const uv = node.inputs["UV"];
+      if (uv === undefined) {
+        throw new Error(`Missing input for ${node.id}`);
+      }
+      const sample = `${texName(node)}.Sample(${samplerName(node)}, ${portRef(ir, uv.fromNodeId, uv.fromPort)})`;
+      let value = sample;
+      if (enumParam(node, "Type", 0) === 1) {
+        // Normal map: unpack from [0,1] back to tangent space [-1,1].
+        value = `normalize(${sample} * 2.0 - 1.0)`;
+      }
+      if (enumParam(node, "Space", 0) === 1) {
+        value = `srgbToLinear(${value})`;
+      }
+      return value;
+    }
+    case "SampleCubemap": {
+      const dir = node.inputs["Dir"];
+      if (dir === undefined) {
+        throw new Error(`Missing input for ${node.id}`);
+      }
+      return `${texName(node)}.Sample(${samplerName(node)}, normalize(${portRef(ir, dir.fromNodeId, dir.fromPort)}))`;
+    }
+    case "NormalVector": {
+      // Object-space transforms the world-space uniform through the
+      // inverse world matrix (standard float4x4 matrix, float3x3 slice).
+      return enumParam(node, "Space", 1) === 0
+        ? `normalize(mul((float3x3) _WorldToObject, _NormalVector))`
+        : `normalize(_NormalVector)`;
+    }
+    case "MainLightDirection":
+      return `normalize(_MainLightDirection)`;
+    case "Camera":
+      // Transparent: never emitted here; portRef resolves uniforms per port.
+      throw new Error(`Camera emits no expression (${node.id})`);
     case "Split": {
       // Split itself emits nothing; consumers read components off its var.
       // Its variable holds the full input vector copy for downstream swizzles.
+      const src = node.inputs["in"];
+      if (src === undefined) {
+        throw new Error(`Missing input for ${node.id}`);
+      }
+      return portRef(ir, src.fromNodeId, src.fromPort);
+    }
+    case "Preview": {
+      // Preview materializes its input into a named intermediate so the
+      // value stays inspectable in GPU debuggers (RenderDoc, PIX, NSight).
       const src = node.inputs["in"];
       if (src === undefined) {
         throw new Error(`Missing input for ${node.id}`);
@@ -111,6 +190,24 @@ export function portRef(ir: GraphIR, fromNodeId: string, fromPort: string): stri
     // The Split variable already aliases the input vector.
     return swizzleRead(base, idx as 0 | 1 | 2 | 3);
   }
+  if (node.op === "Camera") {
+    // Camera is transparent: each output port resolves straight to its
+    // uniform. Position stays raw; Direction is a unit vector.
+    if (fromPort === "Position") {
+      return "_CameraPosition";
+    }
+    if (fromPort === "Direction") {
+      return "normalize(_CameraDirection)";
+    }
+    throw new Error(`Invalid Camera port: ${fromPort}`);
+  }
+  // Sample nodes expose RGBA plus per-component swizzle reads.
+  if (node.op === "SampleTexture2D" || node.op === "SampleCubemap") {
+    const idx = ["RGBA", "R", "G", "B", "A"].indexOf(fromPort);
+    if (idx > 0) {
+      return swizzleRead(base, (idx - 1) as 0 | 1 | 2 | 3);
+    }
+  }
   if (
     node.op === "Reroute" ||
     node.op === "NamedRerouteDeclaration" ||
@@ -139,6 +236,12 @@ function withSplat(varExpr: string, from: HlslType, to: HlslType): string {
 
 export function emitHLSL(ir: GraphIR): string {
   const lines: Array<string> = [];
+  const decls: Array<string> = [];
+  let needsNormalUniform = false;
+  let needsObjectTransform = false;
+  let needsLightUniform = false;
+  let needsCameraUniforms = false;
+  let needsSrgbHelper = false;
   for (const node of ir.nodes) {
     if (node.op === "FragmentOutput") {
       continue;
@@ -151,7 +254,47 @@ export function emitHLSL(ir: GraphIR): string {
       // Transparent: no variable, consumers reference the upstream directly.
       continue;
     }
+    if (node.op === "Camera") {
+      // Transparent: consumers reference the camera uniforms per port.
+      needsCameraUniforms = true;
+      continue;
+    }
+    if (node.op === "SampleTexture2D") {
+      decls.push(`Texture2D ${texName(node)};`, `SamplerState ${samplerName(node)};`);
+      if (enumParam(node, "Space", 0) === 1) {
+        needsSrgbHelper = true;
+      }
+    } else if (node.op === "SampleCubemap") {
+      decls.push(`TextureCube ${texName(node)};`, `SamplerState ${samplerName(node)};`);
+    } else if (node.op === "NormalVector") {
+      needsNormalUniform = true;
+      if (enumParam(node, "Space", 1) === 0) {
+        needsObjectTransform = true;
+      }
+    } else if (node.op === "MainLightDirection") {
+      needsLightUniform = true;
+    }
     lines.push(`${node.outType} ${node.variable} = ${exprFor(ir, node)};`);
+  }
+  if (needsCameraUniforms) {
+    decls.push("float3 _CameraPosition;", "float3 _CameraDirection;");
+  }
+  if (needsNormalUniform) {
+    decls.push("float3 _NormalVector;");
+  }
+  if (needsObjectTransform) {
+    decls.push("float4x4 _WorldToObject;");
+  }
+  if (needsLightUniform) {
+    decls.push("float3 _MainLightDirection;");
+  }
+  // External bindings first, then helper functions, then the entry point.
+  const preamble: Array<string> = [];
+  if (decls.length > 0) {
+    preamble.push(...decls, "");
+  }
+  if (needsSrgbHelper) {
+    preamble.push(SRGB_TO_LINEAR);
   }
   const out = ir.nodes.find((n) => n.id === ir.outputNodeId);
   if (out === undefined) {
@@ -163,5 +306,5 @@ export function emitHLSL(ir: GraphIR): string {
   // semantic (the render target output). `main` is the default entry-point
   // name for fxc and dxc, so the file compiles without extra flags.
   const body = lines.map((line) => `    ${line}`);
-  return ["float4 main() : SV_Target", "{", ...body, "}", ""].join("\n");
+  return [...preamble, "float4 main() : SV_Target", "{", ...body, "}", ""].join("\n");
 }

@@ -13,15 +13,45 @@ describe("shader-nodes", () => {
       "Subtract",
       "Multiply",
       "Divide",
+      "DotProduct",
       "Split",
       "Combine",
       "Reroute",
       "NamedRerouteDeclaration",
       "NamedRerouteUsage",
       "FragmentOutput",
+      "Preview",
+      "SampleTexture2D",
+      "SampleCubemap",
+      "NormalVector",
+      "MainLightDirection",
+      "Camera",
     ] as const) {
       expect(NODE_REGISTRY[t]).toBeDefined();
     }
+  });
+
+  test("enum params expose dropdown metadata", () => {
+    const sample = NODE_REGISTRY["SampleTexture2D"];
+    expect(sample.paramDefs?.map((p) => p.key)).toEqual(["Type", "Space"]);
+    const type = sample.paramDefs?.[0];
+    expect(type?.kind === "enum" && type.options.map((o) => o.label)).toEqual([
+      "Default",
+      "Normal",
+    ]);
+    const normal = NODE_REGISTRY["NormalVector"];
+    expect(normal.paramDefs?.map((p) => p.key)).toEqual(["Space"]);
+  });
+
+  test("dot always reduces to float; samples and scene inputs are fixed-width", () => {
+    expect(resolveOutputType("DotProduct", { a: "float3", b: "float3" })).toBe("float");
+    expect(resolveOutputType("Preview", { in: "float3" })).toBe("float3");
+    expect(resolveOutputType("Preview", {})).toBeNull();
+    expect(resolveOutputType("SampleTexture2D", {})).toBe("float4");
+    expect(resolveOutputType("SampleCubemap", {})).toBe("float4");
+    expect(resolveOutputType("NormalVector", {})).toBe("float3");
+    expect(resolveOutputType("MainLightDirection", {})).toBe("float3");
+    expect(resolveOutputType("Camera", {})).toBe("float3");
   });
 
   test("reroute output passes the input type through", () => {
