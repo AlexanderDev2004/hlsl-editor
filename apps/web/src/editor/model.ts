@@ -4,12 +4,17 @@
 import { Option, Schema } from 'effect'
 import { modifyFields } from 'foldkit/struct'
 
-import type { Graph } from '@hlsl-editor/graph'
+import type { Graph, GraphEdge, GraphNode } from '@hlsl-editor/graph'
+import type {
+  FunctionArg,
+  FunctionDefSource,
+} from '@hlsl-editor/shader-compiler'
 import {
   NODE_REGISTRY,
   createNodeOfType,
   isNodeType,
 } from '@hlsl-editor/shader-nodes'
+import { isMvp1Type } from '@hlsl-editor/shader-types'
 
 import { DEFAULT_KEYMAP } from './shortcuts'
 
@@ -19,6 +24,17 @@ import { DEFAULT_KEYMAP } from './shortcuts'
 export const Vec2 = Schema.Struct({ x: Schema.Number, y: Schema.Number })
 export type Vec2 = typeof Vec2.Type
 
+// Editor node. Ports normally derive from the node registry; function
+// nodes (FunctionInput/FunctionCall) carry per-instance `ports` instead,
+// and a FunctionCall stores the invoked FunctionDef id in `ref`.
+export const EditorPortDef = Schema.Struct({
+  name: Schema.String,
+  direction: Schema.Union([Schema.Literal('in'), Schema.Literal('out')]),
+  valueType: Schema.String,
+  required: Schema.Boolean,
+})
+export type EditorPortDef = typeof EditorPortDef.Type
+
 export const EditorNode = Schema.Struct({
   id: Schema.String,
   type: Schema.String,
@@ -27,6 +43,8 @@ export const EditorNode = Schema.Struct({
     Schema.String,
     Schema.Union([Schema.Number, Schema.Array(Schema.Number)]),
   ),
+  ports: Schema.optional(Schema.Array(EditorPortDef)),
+  ref: Schema.optional(Schema.String),
 })
 export type EditorNode = typeof EditorNode.Type
 
@@ -60,6 +78,17 @@ export const CollapsedNode = Schema.Struct({
 })
 export type CollapsedNode = typeof CollapsedNode.Type
 
+// A Material Function: a named, reusable subgraph. `nodes` contains the
+// extracted nodes plus FunctionInput/FunctionOutput markers; FunctionCall
+// nodes on the canvas reference it by id.
+export const FunctionDef = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  nodes: Schema.Array(EditorNode),
+  edges: Schema.Array(EditorEdge),
+})
+export type FunctionDef = typeof FunctionDef.Type
+
 export const Snapshot = Schema.Struct({
   nodes: Schema.Array(EditorNode),
   edges: Schema.Array(EditorEdge),
@@ -71,6 +100,8 @@ export const Snapshot = Schema.Struct({
   nextNode: Schema.Number,
   nextEdge: Schema.Number,
   nextGroup: Schema.Number,
+  functions: Schema.Array(FunctionDef),
+  nextFunction: Schema.Number,
 })
 export type Snapshot = typeof Snapshot.Type
 
@@ -215,6 +246,8 @@ export const Model = Schema.Struct({
   collapsed: Schema.Array(CollapsedNode),
   selectedCollapsedId: Schema.Option(Schema.String),
   nextCollapsed: Schema.Number,
+  functions: Schema.Array(FunctionDef),
+  nextFunction: Schema.Number,
   rerouteNames: Schema.Record(Schema.String, Schema.String),
   viewport: Schema.Struct({
     x: Schema.Number,
@@ -313,6 +346,8 @@ export function seedModel(): Model {
     collapsed: [],
     selectedCollapsedId: Option.none(),
     nextCollapsed: 1,
+    functions: [],
+    nextFunction: 1,
     rerouteNames: {},
     viewport: { x: 0, y: 0, zoom: 1 },
     drag: { mode: 'idle' },
@@ -367,6 +402,8 @@ export function takeSnapshot(model: Model): Snapshot {
     nextNode: model.nextNode,
     nextEdge: model.nextEdge,
     nextGroup: model.nextGroup,
+    functions: model.functions,
+    nextFunction: model.nextFunction,
   }
 }
 
@@ -393,6 +430,8 @@ export function restoreSnapshot(model: Model, snap: Snapshot): Model {
     nextNode: () => snap.nextNode,
     nextEdge: () => snap.nextEdge,
     nextGroup: () => snap.nextGroup,
+    functions: () => snap.functions,
+    nextFunction: () => snap.nextFunction,
     selectedNodeIds: () => [],
     selectedEdgeId: () => Option.none(),
     hoveredEdgeId: () => Option.none(),
@@ -416,30 +455,92 @@ function toMutableParams(
   )
 }
 
+// Build one domain node from its editor form: registry ports by default,
+// per-instance ports (and the function ref) when the editor node carries
+// them.
+function toDomainNode(node: EditorNode): GraphNode | null {
+  if (!isNodeType(node.type)) {
+    return null
+  }
+  const domain = createNodeOfType(
+    node.type,
+    node.id,
+    node.position,
+    toMutableParams(node.params),
+  )
+  if (node.ports !== undefined) {
+    domain.ports = node.ports.map(p => ({
+      id: `${node.id}:${p.name}`,
+      name: p.name,
+      direction: p.direction,
+      valueType: p.valueType,
+      required: p.required,
+    }))
+  }
+  if (node.ref !== undefined) {
+    domain.ref = node.ref
+  }
+  return domain
+}
+
+function toDomainEdges(edges: ReadonlyArray<EditorEdge>): Array<GraphEdge> {
+  return edges.map(e => ({
+    id: e.id,
+    source: { nodeId: e.sourceNodeId, port: e.sourcePort },
+    target: { nodeId: e.targetNodeId, port: e.targetPort },
+  }))
+}
+
 export function toDomainGraph(model: Model): Graph {
   const nodes = model.nodes.flatMap(node => {
-    if (!isNodeType(node.type)) {
-      return []
-    }
-    return [
-      createNodeOfType(
-        node.type,
-        node.id,
-        node.position,
-        toMutableParams(node.params),
-      ),
-    ]
+    const domain = toDomainNode(node)
+    return domain === null ? [] : [domain]
   })
   return {
     version: 1,
     nodes,
-    edges: model.edges.map(e => ({
-      id: e.id,
-      source: { nodeId: e.sourceNodeId, port: e.sourcePort },
-      target: { nodeId: e.targetNodeId, port: e.targetPort },
-    })),
+    edges: toDomainEdges(model.edges),
     outputNodeId: Option.getOrNull(model.outputNodeId),
   }
+}
+
+// Convert stored Material Functions into the compiler's FunctionDefSource
+// shape. A function's arguments come from its FunctionInput nodes (the out
+// port name is the argument name, its type the argument type).
+export function toDomainFunctions(
+  functions: ReadonlyArray<FunctionDef>,
+): Array<FunctionDefSource> {
+  return functions.flatMap(fn => {
+    const output = fn.nodes.find(n => n.type === 'FunctionOutput')
+    if (output === undefined) {
+      return []
+    }
+    const args: Array<FunctionArg> = []
+    for (const node of fn.nodes) {
+      if (node.type !== 'FunctionInput') {
+        continue
+      }
+      const outPort = node.ports?.find(p => p.direction === 'out')
+      if (outPort === undefined || !isMvp1Type(outPort.valueType)) {
+        continue
+      }
+      args.push({ name: outPort.name, type: outPort.valueType })
+    }
+    const nodes = fn.nodes.flatMap(node => {
+      const domain = toDomainNode(node)
+      return domain === null ? [] : [domain]
+    })
+    return [
+      {
+        id: fn.id,
+        name: fn.name,
+        args,
+        nodes,
+        edges: toDomainEdges(fn.edges),
+        outputNodeId: output.id,
+      },
+    ]
+  })
 }
 
 // Imports arrive from untrusted JSON, so params are rebuilt from the node
@@ -468,6 +569,9 @@ function sanitizeParams(
   return clean
 }
 
+// Function bodies deserialize through the same node/edge sanitization as
+// the main graph; a function survives import only when structurally sane
+// (valid unique HLSL identifier name, exactly one FunctionOutput).
 export function fromSerialized(data: {
   version: number
   nodes: Array<{
@@ -475,6 +579,13 @@ export function fromSerialized(data: {
     type: string
     position: { x: number; y: number }
     params: Record<string, number | Array<number>>
+    ports?: Array<{
+      name: string
+      direction: 'in' | 'out'
+      valueType: string
+      required: boolean
+    }>
+    ref?: string
   }>
   edges: Array<{
     id: string
@@ -488,6 +599,28 @@ export function fromSerialized(data: {
     name: string
     nodeIds: ReadonlyArray<string>
   }>
+  functions?: Array<{
+    id: string
+    name: string
+    nodes: Array<{
+      id: string
+      type: string
+      position: { x: number; y: number }
+      params: Record<string, number | Array<number>>
+      ports?: Array<{
+        name: string
+        direction: 'in' | 'out'
+        valueType: string
+        required: boolean
+      }>
+      ref?: string
+    }>
+    edges: Array<{
+      id: string
+      source: { nodeId: string; port: string }
+      target: { nodeId: string; port: string }
+    }>
+  }>
 }): Pick<
   Model,
   | 'nodes'
@@ -498,6 +631,8 @@ export function fromSerialized(data: {
   | 'rerouteNames'
   | 'collapsed'
   | 'nextCollapsed'
+  | 'functions'
+  | 'nextFunction'
 > {
   const nodes: Array<EditorNode> = data.nodes
     .filter(n => isNodeType(n.type))
@@ -506,6 +641,8 @@ export function fromSerialized(data: {
       type: n.type,
       position: { ...n.position },
       params: sanitizeParams(n.type, n.params),
+      ...sanitizePorts(n.type, n.ports),
+      ...sanitizeRef(n.ref),
     }))
   const edges: Array<EditorEdge> = data.edges.map(e => ({
     id: e.id,
@@ -557,5 +694,149 @@ export function fromSerialized(data: {
     rerouteNames: data.rerouteNames ?? {},
     collapsed: collapsed.map(c => ({ ...c, nodeIds: [...c.nodeIds] })),
     nextCollapsed: maxCollapsed + 1,
+    ...sanitizeFunctions(data),
   }
+}
+
+// Per-instance ports only mean something on the function node kinds; for
+// every registry type the registry's own ports win. Port values are
+// sanitized: non-empty names, a known direction, an MVP1 value type.
+function sanitizePorts(
+  type: string,
+  ports:
+    | ReadonlyArray<{
+        name: string
+        direction: 'in' | 'out'
+        valueType: string
+        required: boolean
+      }>
+    | undefined,
+): Pick<EditorNode, 'ports'> {
+  const isFunctionKind =
+    type === 'FunctionCall' ||
+    type === 'FunctionInput' ||
+    type === 'FunctionOutput'
+  if (!isFunctionKind || ports === undefined) {
+    return {}
+  }
+  const clean = ports.flatMap(p => {
+    if (
+      p.name === '' ||
+      !isMvp1Type(p.valueType) ||
+      (p.direction !== 'in' && p.direction !== 'out')
+    ) {
+      return []
+    }
+    return [
+      {
+        name: p.name,
+        direction: p.direction,
+        valueType: p.valueType,
+        required: p.required,
+      },
+    ]
+  })
+  return clean.length > 0 ? { ports: clean } : {}
+}
+
+function sanitizeRef(ref: string | undefined): Pick<EditorNode, 'ref'> {
+  return ref !== undefined && ref !== '' ? { ref } : {}
+}
+
+// Keep only structurally sane functions, rename them to unique valid HLSL
+// identifiers, and recompute the next function counter from what survived.
+function sanitizeFunctions(data: {
+  functions?:
+    | ReadonlyArray<{
+        id: string
+        name: string
+        nodes: ReadonlyArray<{
+          id: string
+          type: string
+          position: { x: number; y: number }
+          params: Record<string, number | Array<number>>
+          ports?: ReadonlyArray<{
+            name: string
+            direction: 'in' | 'out'
+            valueType: string
+            required: boolean
+          }>
+          ref?: string
+        }>
+        edges: ReadonlyArray<{
+          id: string
+          source: { nodeId: string; port: string }
+          target: { nodeId: string; port: string }
+        }>
+      }>
+    | undefined
+}): Pick<Model, 'functions' | 'nextFunction'> {
+  const raw = data.functions ?? []
+  const functions: Array<FunctionDef> = []
+  const usedNames = new Set<string>()
+  let counter = 1
+  for (const fn of raw) {
+    const outputCount = fn.nodes.filter(n => n.type === 'FunctionOutput').length
+    if (outputCount !== 1) {
+      continue
+    }
+    const nodeIds = new Set(fn.nodes.map(n => n.id))
+    if (
+      fn.edges.some(
+        e => !nodeIds.has(e.source.nodeId) || !nodeIds.has(e.target.nodeId),
+      )
+    ) {
+      continue
+    }
+    const nodes: Array<EditorNode> = fn.nodes
+      .filter(n => isNodeType(n.type))
+      .map(n => ({
+        id: n.id,
+        type: n.type,
+        position: { ...n.position },
+        params: sanitizeParams(n.type, n.params),
+        ...sanitizePorts(n.type, n.ports),
+        ...sanitizeRef(n.ref),
+      }))
+    if (!nodes.some(n => n.type === 'FunctionOutput')) {
+      continue
+    }
+    // Sanitize to a valid, unique HLSL identifier (call sites reference the
+    // function by id, so renaming here cannot break anything).
+    let name = fn.name.replace(/[^A-Za-z0-9_]/g, '')
+    if (name === '' || /^[0-9]/.test(name)) {
+      name = `Fn${counter}`
+    }
+    let unique = name
+    let suffix = 2
+    while (usedNames.has(unique)) {
+      unique = `${name}_${suffix}`
+      suffix += 1
+    }
+    usedNames.add(unique)
+    functions.push({
+      id: fn.id,
+      name: unique,
+      nodes,
+      edges: fn.edges.map(e => ({
+        id: e.id,
+        sourceNodeId: e.source.nodeId,
+        sourcePort: e.source.port,
+        targetNodeId: e.target.nodeId,
+        targetPort: e.target.port,
+      })),
+    })
+    counter += 1
+  }
+  let maxFn = 0
+  for (const fn of functions) {
+    const m = /^Fn(\d+)$/.exec(fn.name)
+    if (m !== null && m[1] !== undefined) {
+      const v = Number.parseInt(m[1], 10)
+      if (Number.isFinite(v) && v > maxFn) {
+        maxFn = v
+      }
+    }
+  }
+  return { functions, nextFunction: maxFn + 1 }
 }

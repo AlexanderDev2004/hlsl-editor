@@ -43,7 +43,27 @@ export function nodeHeight(type: string): number {
     return 64
   }
   const def = NODE_REGISTRY[type]
-  const rows = Math.max(def.inputs.length, def.outputs.length, 1)
+  return heightForRows(type, Math.max(def.inputs.length, def.outputs.length, 1))
+}
+
+// Node-aware height: function nodes (FunctionCall) carry per-instance
+// ports, so their row count comes from those instead of the registry.
+export function nodeHeightFor(
+  type: string,
+  ports: ReadonlyArray<{ direction: 'in' | 'out' }> | undefined,
+): number {
+  if (ports === undefined) {
+    return nodeHeight(type)
+  }
+  const rows = Math.max(
+    ports.filter(p => p.direction === 'in').length,
+    ports.filter(p => p.direction === 'out').length,
+    1,
+  )
+  return heightForRows(type, rows)
+}
+
+function heightForRows(type: string, rows: number): number {
   // Preview cards grow an extra band under the ports for the live swatch.
   const previewBand = type === 'Preview' ? 46 : 0
   return HEADER_H + rows * ROW_H + PAD * 2 + previewBand

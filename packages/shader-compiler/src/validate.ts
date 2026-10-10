@@ -1,5 +1,5 @@
 import { detectCycle, incomingEdge, type Graph } from "@hlsl-editor/graph";
-import { NODE_REGISTRY, isNodeType, resolveOutputType } from "@hlsl-editor/shader-nodes";
+import { isNodeType, resolveOutputType } from "@hlsl-editor/shader-nodes";
 import {
   canConnect,
   componentCount,
@@ -11,27 +11,11 @@ import {
 
 import { err, type CompilerError } from "./errors";
 
-// Validate structure + types. Returns errors (empty = valid).
-export function validate(graph: Graph): Array<CompilerError> {
+// Structural validation shared by the main graph and Material Function
+// bodies: cycles, edge endpoints/types, required inputs. Does NOT require
+// an entry point (a function body ends at a FunctionOutput instead).
+export function validateStructure(graph: Graph): Array<CompilerError> {
   const errors: Array<CompilerError> = [];
-
-  const outputNodes = graph.nodes.filter((n) => n.type === "FragmentOutput");
-  if (outputNodes.length === 0 || graph.outputNodeId === null) {
-    errors.push(
-      err("MissingOutput", "Graph has no Fragment Output node. Add one to generate HLSL."),
-    );
-  } else if (outputNodes.length > 1) {
-    errors.push(
-      err(
-        "InvalidGraph",
-        `Graph has ${outputNodes.length} Fragment Output nodes; exactly one is required.`,
-      ),
-    );
-  }
-  const outputNode = graph.nodes.find((n) => n.id === graph.outputNodeId);
-  if (graph.outputNodeId !== null && outputNode === undefined) {
-    errors.push(err("InvalidGraph", `Output node not found: ${graph.outputNodeId}.`));
-  }
 
   const cycle = detectCycle(graph);
   if (cycle.hasCycle) {
@@ -51,12 +35,14 @@ export function validate(graph: Graph): Array<CompilerError> {
       errors.push(err("InvalidGraph", `Edge ${edge.id} references unknown node type.`, target.id));
       continue;
     }
-    const sourceDef = NODE_REGISTRY[source.type];
-    const targetDef = NODE_REGISTRY[target.type];
-    const sourcePortDef =
-      sourceDef.outputs.find((p) => p.name === edge.source.port) ??
-      sourceDef.inputs.find((p) => p.name === edge.source.port);
-    const targetPortDef = targetDef.inputs.find((p) => p.name === edge.target.port);
+    // Port lookups use the node's own ports so per-instance ports (e.g.
+    // FunctionCall arguments) validate exactly like registry ports.
+    const sourcePortDef = source.ports.find(
+      (p) => p.name === edge.source.port && p.direction === "out",
+    );
+    const targetPortDef = target.ports.find(
+      (p) => p.name === edge.target.port && p.direction === "in",
+    );
     if (sourcePortDef === undefined || sourcePortDef.direction !== "out") {
       errors.push(
         err(
@@ -81,10 +67,12 @@ export function validate(graph: Graph): Array<CompilerError> {
     if (sourceType === null) {
       continue;
     }
-    const allowed = targetPortDef.accepts ?? [targetPortDef.valueType];
+    const allowed = (targetPortDef.accepts ?? [targetPortDef.valueType]).filter(
+      (t): t is HlslType => isMvp1Type(t),
+    );
     const ok = allowed.some((t) => canConnect(sourceType, t));
     if (!ok) {
-      const expected = allowed.length === 1 ? (allowed[0] as string) : allowed.join(" | ");
+      const expected = targetPortDef.valueType;
       errors.push(
         err(
           "TypeMismatch",
@@ -101,9 +89,8 @@ export function validate(graph: Graph): Array<CompilerError> {
       errors.push(err("InvalidGraph", `Unknown node type: ${node.type}.`, node.id));
       continue;
     }
-    const def = NODE_REGISTRY[node.type];
-    for (const input of def.inputs) {
-      if (!input.required) {
+    for (const input of node.ports) {
+      if (input.direction !== "in" || !input.required) {
         continue;
       }
       const edge = incomingEdge(graph, node.id, input.name);
@@ -162,6 +149,32 @@ export function validate(graph: Graph): Array<CompilerError> {
   return errors;
 }
 
+// Full main-graph validation: structure plus the Fragment Output entry
+// point requirement.
+export function validate(graph: Graph): Array<CompilerError> {
+  const errors = validateStructure(graph);
+
+  const outputNodes = graph.nodes.filter((n) => n.type === "FragmentOutput");
+  if (outputNodes.length === 0 || graph.outputNodeId === null) {
+    errors.push(
+      err("MissingOutput", "Graph has no Fragment Output node. Add one to generate HLSL."),
+    );
+  } else if (outputNodes.length > 1) {
+    errors.push(
+      err(
+        "InvalidGraph",
+        `Graph has ${outputNodes.length} Fragment Output nodes; exactly one is required.`,
+      ),
+    );
+  }
+  const outputNode = graph.nodes.find((n) => n.id === graph.outputNodeId);
+  if (graph.outputNodeId !== null && outputNode === undefined) {
+    errors.push(err("InvalidGraph", `Output node not found: ${graph.outputNodeId}.`));
+  }
+
+  return errors;
+}
+
 // Best-effort upstream output type for cycle-free error messages.
 // Returns null when it cannot be determined (errors reported elsewhere).
 // Cycle-guarded: returns null instead of recursing forever on cyclic graphs
@@ -180,8 +193,7 @@ export function upstreamPortType(
   if (node === undefined || !isNodeType(node.type)) {
     return null;
   }
-  const def = NODE_REGISTRY[node.type];
-  const outDef = def.outputs.find((p) => p.name === portName);
+  const outDef = node.ports.find((p) => p.direction === "out" && p.name === portName);
   if (outDef === undefined) {
     return null;
   }
@@ -191,7 +203,7 @@ export function upstreamPortType(
     node.type === "Float3" ||
     node.type === "Float4"
   ) {
-    return outDef.valueType;
+    return isMvp1Type(outDef.valueType) ? outDef.valueType : null;
   }
   if (
     node.type === "Add" ||
@@ -250,6 +262,10 @@ export function upstreamPortType(
       }
     }
     return resolveOutputType("Combine", inputs);
+  }
+  if (node.type === "FunctionCall" || node.type === "FunctionInput") {
+    // Per-instance ports carry the concrete argument/return type directly.
+    return isMvp1Type(outDef.valueType) ? outDef.valueType : null;
   }
   return null;
 }

@@ -10,8 +10,16 @@ import {
   generate,
   upstreamPortType,
 } from '@hlsl-editor/shader-compiler'
-import { NODE_REGISTRY, isNodeType } from '@hlsl-editor/shader-nodes'
-import { canConnect, connectionErrorMessage } from '@hlsl-editor/shader-types'
+import {
+  NODE_REGISTRY,
+  isNodeType,
+  isRerouteType,
+} from '@hlsl-editor/shader-nodes'
+import {
+  type HlslType,
+  canConnect,
+  connectionErrorMessage,
+} from '@hlsl-editor/shader-types'
 
 import { hiddenNodeIds } from './collapse'
 import { isValidGroupColor, normalizeHexColor } from './color-picker'
@@ -30,6 +38,7 @@ import {
   ZOOM_STEP,
   clampZoom,
   nodeHeight,
+  nodeHeightFor,
   nodeWidth,
 } from './layout'
 import { nodesInRect, worldRect } from './marquee'
@@ -38,6 +47,8 @@ import {
   type CollapsedNode,
   type EditorEdge,
   type EditorNode,
+  type EditorPortDef,
+  type FunctionDef,
   type Group,
   type LogEntry,
   type Model,
@@ -47,6 +58,7 @@ import {
   restoreSnapshot,
   seedModel,
   takeSnapshot,
+  toDomainFunctions,
   toDomainGraph,
 } from './model'
 import { isLoadingVariant } from './node-status'
@@ -86,11 +98,20 @@ function withLog(model: Model, level: LogEntry['level'], text: string): Model {
   })
 }
 
+interface DecodedPortDef {
+  name: string
+  direction: 'in' | 'out'
+  valueType: string
+  required: boolean
+}
+
 interface DecodedNode {
   id: string
   type: string
   position: { x: number; y: number }
   params: Record<string, number | Array<number>>
+  ports?: Array<DecodedPortDef>
+  ref?: string
 }
 
 interface DecodedEdge {
@@ -146,6 +167,44 @@ function decodeParams(
   )
 }
 
+// Per-instance ports serialize only on function node kinds (FunctionInput
+// carries the argument name/type, FunctionCall mirrors the signature).
+function decodePorts(raw: unknown): Array<DecodedPortDef> | null {
+  if (raw === undefined) {
+    return []
+  }
+  if (!Array.isArray(raw)) {
+    return null
+  }
+  const ports: Array<DecodedPortDef> = []
+  for (const item of raw) {
+    if (
+      !Predicate.isObject(item) ||
+      !('name' in item) ||
+      !('direction' in item) ||
+      !('valueType' in item) ||
+      !('required' in item)
+    ) {
+      return null
+    }
+    if (
+      !Predicate.isString(item.name) ||
+      !Predicate.isString(item.valueType) ||
+      !Predicate.isBoolean(item.required) ||
+      (item.direction !== 'in' && item.direction !== 'out')
+    ) {
+      return null
+    }
+    ports.push({
+      name: item.name,
+      direction: item.direction,
+      valueType: item.valueType,
+      required: item.required,
+    })
+  }
+  return ports
+}
+
 function decodeNode(raw: unknown): DecodedNode | null {
   if (
     !Predicate.isObject(raw) ||
@@ -164,7 +223,19 @@ function decodeNode(raw: unknown): DecodedNode | null {
   if (position === null || params === null) {
     return null
   }
-  return { id: raw.id, type: raw.type, position, params }
+  const ports = decodePorts('ports' in raw ? raw.ports : undefined)
+  if (ports === null) {
+    return null
+  }
+  const ref = 'ref' in raw && Predicate.isString(raw.ref) ? raw.ref : undefined
+  return {
+    id: raw.id,
+    type: raw.type,
+    position,
+    params,
+    ...(ports.length > 0 ? { ports } : {}),
+    ...(ref !== undefined ? { ref } : {}),
+  }
 }
 
 function decodeEndpoint(raw: unknown): { nodeId: string; port: string } | null {
@@ -247,6 +318,12 @@ function parseGraphText(text: string):
         outputNodeId: string | null
         rerouteNames: Record<string, string>
         collapsed: Array<CollapsedNode>
+        functions: Array<{
+          id: string
+          name: string
+          nodes: Array<DecodedNode>
+          edges: Array<DecodedEdge>
+        }>
       }
     }
   | { ok: false; reason: string } {
@@ -259,7 +336,9 @@ function parseGraphText(text: string):
   ) {
     return { ok: false, reason: 'Import file is not a graph object.' }
   }
-  if (raw.version !== 1) {
+  // Version 1 predates Material Functions (functions default to empty);
+  // version 2 adds the functions array.
+  if (raw.version !== 1 && raw.version !== 2) {
     return {
       ok: false,
       reason: `Unsupported graph version: ${String(raw.version)}.`,
@@ -294,15 +373,55 @@ function parseGraphText(text: string):
   if (collapsed.some(c => c === null)) {
     return { ok: false, reason: 'Import file has an invalid collapsed group.' }
   }
+  const functionsRaw = 'functions' in raw ? raw.functions : []
+  if (!Array.isArray(functionsRaw)) {
+    return { ok: false, reason: 'Import file has invalid functions.' }
+  }
+  const functions: Array<{
+    id: string
+    name: string
+    nodes: Array<DecodedNode>
+    edges: Array<DecodedEdge>
+  }> = []
+  for (const fn of functionsRaw) {
+    if (
+      !Predicate.isObject(fn) ||
+      !('id' in fn) ||
+      !('name' in fn) ||
+      !('nodes' in fn) ||
+      !('edges' in fn) ||
+      !Predicate.isString(fn.id) ||
+      !Predicate.isString(fn.name) ||
+      !Array.isArray(fn.nodes) ||
+      !Array.isArray(fn.edges)
+    ) {
+      return { ok: false, reason: 'Import file has an invalid function.' }
+    }
+    const fnNodes = fn.nodes.map(decodeNode)
+    if (fnNodes.some(n => n === null)) {
+      return { ok: false, reason: 'Import file has an invalid function node.' }
+    }
+    const fnEdges = fn.edges.map(decodeEdge)
+    if (fnEdges.some(e => e === null)) {
+      return { ok: false, reason: 'Import file has an invalid function edge.' }
+    }
+    functions.push({
+      id: fn.id,
+      name: fn.name,
+      nodes: fnNodes.flatMap(n => (n === null ? [] : [n])),
+      edges: fnEdges.flatMap(e => (e === null ? [] : [e])),
+    })
+  }
   return {
     ok: true,
     data: {
-      version: 1,
+      version: typeof raw.version === 'number' ? raw.version : 1,
       nodes: nodes.flatMap(n => (n === null ? [] : [n])),
       edges: edges.flatMap(e => (e === null ? [] : [e])),
       outputNodeId,
       rerouteNames,
       collapsed: collapsed.flatMap(c => (c === null ? [] : [c])),
+      functions,
     },
   }
 }
@@ -331,6 +450,8 @@ function applyImported(model: Model, text: string, pushUndo: boolean): Model {
       nextNode: () => restored.nextNode,
       nextEdge: () => restored.nextEdge,
       nextGroup: () => 1,
+      functions: () => restored.functions,
+      nextFunction: () => restored.nextFunction,
       selectedNodeIds: () => [],
       selectedGroupId: () => Option.none(),
       selectedCollapsedId: () => Option.none(),
@@ -477,11 +598,252 @@ function ungroupSelected(model: Model): Model {
   })
 }
 
+// Extracts the selected nodes into a Material Function (Unreal-style):
+// internal wiring is preserved, every incoming wire becomes a function
+// argument (named after the consumed input port), the single outgoing wire
+// becomes the return value, and the selection is replaced by one
+// FunctionCall node whose ports mirror the new signature.
+function createFunctionFromSelection(model: Model): Model {
+  const selectedIds = new Set(model.selectedNodeIds)
+  const selected = model.nodes.filter(n => selectedIds.has(n.id))
+  if (selected.length === 0) {
+    return withLog(
+      model,
+      'error',
+      'Select nodes to extract into a function first.',
+    )
+  }
+  const invalid = selected.find(
+    n =>
+      n.type === 'FragmentOutput' ||
+      n.type === 'FunctionCall' ||
+      n.type === 'FunctionInput' ||
+      n.type === 'FunctionOutput' ||
+      isRerouteType(n.type),
+  )
+  if (invalid !== undefined) {
+    const reason =
+      invalid.type === 'FragmentOutput'
+        ? 'the Fragment Output must stay on the main graph'
+        : invalid.type === 'FunctionCall'
+          ? 'nested functions are not supported'
+          : `${invalid.type} nodes cannot be part of an extraction`
+    return withLog(model, 'error', `Cannot create a function: ${reason}.`)
+  }
+  const graph = toDomainGraph(model)
+  const argEdges = model.edges.filter(
+    e => selectedIds.has(e.targetNodeId) && !selectedIds.has(e.sourceNodeId),
+  )
+  const outEdges = model.edges.filter(
+    e => selectedIds.has(e.sourceNodeId) && !selectedIds.has(e.targetNodeId),
+  )
+  if (outEdges.length !== 1) {
+    return withLog(
+      model,
+      'error',
+      outEdges.length === 0
+        ? 'Cannot create a function: the selection has no outgoing wire. Connect it to something outside the selection first.'
+        : `Cannot create a function: the selection has ${outEdges.length} outgoing wires; exactly one is required.`,
+    )
+  }
+  const outEdge = outEdges[0]
+  if (outEdge === undefined) {
+    return model
+  }
+  const returnType = upstreamPortType(
+    graph,
+    outEdge.sourceNodeId,
+    outEdge.sourcePort,
+  )
+  if (returnType === null) {
+    return withLog(
+      model,
+      'error',
+      'Cannot create a function: the output type cannot be resolved yet.',
+    )
+  }
+  const argDefs: Array<{ edge: EditorEdge; name: string; type: HlslType }> = []
+  const usedArgNames = new Set<string>()
+  for (const edge of argEdges) {
+    const type = upstreamPortType(graph, edge.sourceNodeId, edge.sourcePort)
+    if (type === null) {
+      return withLog(
+        model,
+        'error',
+        `Cannot create a function: the type of ${edge.sourceNodeId}.${edge.sourcePort} is not resolved yet.`,
+      )
+    }
+    let baseName = edge.targetPort.replace(/[^A-Za-z0-9_]/g, '')
+    if (baseName === '' || /^[0-9]/.test(baseName)) {
+      baseName = 'Value'
+    }
+    let name = baseName
+    let suffix = 2
+    while (usedArgNames.has(name)) {
+      name = `${baseName}${suffix}`
+      suffix += 1
+    }
+    usedArgNames.add(name)
+    argDefs.push({ edge, name, type })
+  }
+  const fnId = `f${model.nextFunction}`
+  const fnName = `Fn${model.nextFunction}`
+  const callId = `n${model.nextNode}`
+  const centroid = {
+    x: Math.round(
+      selected.reduce((sum, n) => sum + n.position.x, 0) / selected.length,
+    ),
+    y: Math.round(
+      selected.reduce((sum, n) => sum + n.position.y, 0) / selected.length,
+    ),
+  }
+  // Function definition: the extracted nodes, one FunctionInput per argument
+  // (its out port IS the argument), and one FunctionOutput for the return.
+  const defNodes: Array<FunctionDef['nodes'][number]> = [
+    ...selected.map(n => ({ ...n })),
+    ...argDefs.map((arg, i): EditorNode => ({
+      id: `${fnId}_arg${i}`,
+      type: 'FunctionInput',
+      position: { x: 0, y: i * 120 },
+      params: {},
+      ports: [
+        {
+          name: arg.name,
+          direction: 'out',
+          valueType: arg.type,
+          required: false,
+        },
+      ],
+    })),
+    {
+      id: `${fnId}_out`,
+      type: 'FunctionOutput',
+      position: { x: 300, y: 0 },
+      params: {},
+    },
+  ]
+  const defEdges: Array<FunctionDef['edges'][number]> = [
+    ...model.edges
+      .filter(
+        e => selectedIds.has(e.sourceNodeId) && selectedIds.has(e.targetNodeId),
+      )
+      .map(e => ({ ...e })),
+    ...argDefs.map((arg, i): EditorEdge => ({
+      id: `${fnId}_arg${i}e`,
+      sourceNodeId: `${fnId}_arg${i}`,
+      sourcePort: arg.name,
+      targetNodeId: arg.edge.targetNodeId,
+      targetPort: arg.edge.targetPort,
+    })),
+    {
+      id: `${fnId}_rete`,
+      sourceNodeId: outEdge.sourceNodeId,
+      sourcePort: outEdge.sourcePort,
+      targetNodeId: `${fnId}_out`,
+      targetPort: 'in',
+    },
+  ]
+  const callNode: EditorNode = {
+    id: callId,
+    type: 'FunctionCall',
+    position: centroid,
+    params: {},
+    ref: fnId,
+    ports: [
+      ...argDefs.map((arg): EditorPortDef => ({
+        name: arg.name,
+        direction: 'in',
+        valueType: arg.type,
+        required: true,
+      })),
+      { name: 'out', direction: 'out', valueType: returnType, required: false },
+    ],
+  }
+  const internalEdgeIds = new Set(
+    model.edges
+      .filter(
+        e => selectedIds.has(e.sourceNodeId) && selectedIds.has(e.targetNodeId),
+      )
+      .map(e => e.id),
+  )
+  const argEdgeById = new Map(argDefs.map(arg => [arg.edge.id, arg]))
+  const rewiredEdges: Array<EditorEdge> = model.edges
+    .filter(e => !internalEdgeIds.has(e.id) && e.id !== outEdge.id)
+    .map(e => {
+      const arg = argEdgeById.get(e.id)
+      return arg === undefined
+        ? e
+        : { ...e, targetNodeId: callId, targetPort: arg.name }
+    })
+  const callOutputEdge: EditorEdge = {
+    id: `e${model.nextEdge}`,
+    sourceNodeId: callId,
+    sourcePort: 'out',
+    targetNodeId: outEdge.targetNodeId,
+    targetPort: outEdge.targetPort,
+  }
+  const fnDef: FunctionDef = {
+    id: fnId,
+    name: fnName,
+    nodes: defNodes,
+    edges: defEdges,
+  }
+  const base = pushHistory(model)
+  return modifyFields(
+    withLog(
+      base,
+      'success',
+      `Created ${fnName}(${argDefs.map(a => a.name).join(', ')}) — the selection was replaced by ${callId}.`,
+    ),
+    {
+      nodes: () => [
+        ...base.nodes.filter(n => !selectedIds.has(n.id)),
+        callNode,
+      ],
+      edges: () => [...rewiredEdges, callOutputEdge],
+      functions: () => [...base.functions, fnDef],
+      groups: () =>
+        base.groups
+          .map(group => ({
+            ...group,
+            nodeIds: group.nodeIds.filter(id => !selectedIds.has(id)),
+          }))
+          .filter(group => group.nodeIds.length > 0),
+      collapsed: () =>
+        base.collapsed
+          .map(entry => ({
+            ...entry,
+            nodeIds: entry.nodeIds.filter(id => !selectedIds.has(id)),
+          }))
+          .filter(entry => entry.nodeIds.length > 0),
+      nextNode: () => base.nextNode + 1,
+      nextEdge: () => base.nextEdge + 1,
+      nextFunction: () => base.nextFunction + 1,
+      selectedNodeIds: () => [callId],
+      selectedEdgeId: () => Option.none(),
+      selectedGroupId: () => Option.none(),
+      selectedCollapsedId: () => Option.none(),
+      pending: () => ({ active: false, fromNodeId: '', fromPort: '' }),
+    },
+  )
+}
+
 // Shared by the toolbar "Add node" button and the right-click menu. Validates
 // the type and the single-Fragment-Output rule, then inserts and selects it.
 function addNodeAt(model: Model, type: string, x: number, y: number): Model {
   if (!isNodeType(type)) {
     return withLog(model, 'error', `Unknown node type: ${type}.`)
+  }
+  if (
+    type === 'FunctionCall' ||
+    type === 'FunctionInput' ||
+    type === 'FunctionOutput'
+  ) {
+    return withLog(
+      model,
+      'error',
+      'Function nodes are created by selecting nodes and choosing Create Function.',
+    )
   }
   if (type === 'FragmentOutput' && Option.isSome(model.outputNodeId)) {
     return withLog(
@@ -562,13 +924,9 @@ function attemptConnect(
       'Cannot connect: source type is not ready yet. Connect its inputs first.',
     )
   }
-  const targetDef = isNodeType(targetNode.type)
-    ? NODE_REGISTRY[targetNode.type]
-    : null
-  const targetInput = targetDef?.inputs.find(i => i.name === toPort)
-  const allowed =
-    targetInput?.accepts ??
-    (targetPortDef !== undefined ? [targetPortDef.valueType] : [])
+  // Instance ports (FunctionCall arguments) declare exactly their own type;
+  // registry ports carry their accepts list on the domain node.
+  const allowed = targetPortDef.accepts ?? [targetPortDef.valueType]
   const ok = allowed.some(t => canConnect(sourceType, t))
   if (!ok) {
     const single = allowed.length === 1 ? allowed[0] : undefined
@@ -598,7 +956,8 @@ function attemptConnect(
 }
 
 // Direction of a named port on a node, or null when the node or port is
-// unknown. Shared by the wire-drag handlers.
+// unknown. Shared by the wire-drag handlers. Instance ports (on function
+// nodes) are checked first; the registry covers every other kind.
 function portDirectionOf(
   model: Model,
   nodeId: string,
@@ -607,6 +966,10 @@ function portDirectionOf(
   const node = model.nodes.find(n => n.id === nodeId)
   if (node === undefined || !isNodeType(node.type)) {
     return null
+  }
+  if (node.ports !== undefined) {
+    const found = node.ports.find(p => p.name === port)
+    return found?.direction ?? null
   }
   const def = NODE_REGISTRY[node.type]
   if (def.inputs.some(p => p.name === port)) {
@@ -687,7 +1050,7 @@ function nodeAtWorldPoint(model: Model, x: number, y: number): string | null {
       x >= n.position.x &&
       x <= n.position.x + nodeWidth(n.type) &&
       y >= n.position.y &&
-      y <= n.position.y + nodeHeight(n.type)
+      y <= n.position.y + nodeHeightFor(n.type, n.ports)
     )
   })
   return found?.id ?? null
@@ -2023,6 +2386,9 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       model: dismissNodeMenu(distributeNodes(model, axis)),
     }),
     CollapsedSelection: () => ({ model: collapseSelection(model) }),
+    RequestedCreateFunction: () => ({
+      model: createFunctionFromSelection(model),
+    }),
     ExpandedCollapsed: ({ collapsedId }) => ({
       model: expandCollapsed(model, collapsedId),
     }),
@@ -2233,12 +2599,13 @@ export const update = (model: Model, message: Message): UpdateReturn =>
     RequestedSave: () => {
       const json = JSON.stringify(
         {
-          version: 1,
+          version: 2,
           nodes: model.nodes,
           edges: model.edges,
           outputNodeId: Option.getOrNull(model.outputNodeId),
           rerouteNames: model.rerouteNames,
           collapsed: model.collapsed,
+          functions: model.functions,
         },
         null,
         2,
@@ -2281,6 +2648,8 @@ export const update = (model: Model, message: Message): UpdateReturn =>
             nextNode: () => restored.nextNode,
             nextEdge: () => restored.nextEdge,
             nextGroup: () => 1,
+            functions: () => restored.functions,
+            nextFunction: () => restored.nextFunction,
             selectedNodeIds: () => [],
             selectedGroupId: () => Option.none(),
             selectedCollapsedId: () => Option.none(),
@@ -2372,7 +2741,9 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       model: withLog(model, 'error', `Import failed: ${reason}`),
     }),
     RequestedCopyHlsl: () => {
-      const result = generate(toDomainGraph(model))
+      const result = generate(toDomainGraph(model), {
+        functions: toDomainFunctions(model.functions),
+      })
       if (!result.ok) {
         const first = result.errors[0]
         return {
@@ -2392,7 +2763,9 @@ export const update = (model: Model, message: Message): UpdateReturn =>
       model: withLog(model, 'error', `Copy failed: ${reason}`),
     }),
     RequestedPlay: () => {
-      const result = evaluateGraph(toDomainGraph(model))
+      const result = evaluateGraph(toDomainGraph(model), {
+        functions: toDomainFunctions(model.functions),
+      })
       if (!result.ok) {
         return {
           model: withLog(

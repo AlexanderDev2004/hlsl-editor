@@ -34,7 +34,7 @@ function enumParam(node: IRNode, key: string, fallback: number): number {
 // The sRGB→linear transfer used when a 2D sample's Space is Linear, per the
 // sRGB standard (c <= 0.04045 ? c/12.92 : ((c+0.055)/1.055)^2.4). The HLSL
 // ternary applies per component when the condition is a vector.
-const SRGB_TO_LINEAR = [
+export const SRGB_TO_LINEAR = [
   "float3 srgbToLinear(float3 c)",
   "{",
   "    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);",
@@ -42,7 +42,11 @@ const SRGB_TO_LINEAR = [
   "",
 ].join("\n");
 
-function exprFor(ir: GraphIR, node: IRNode): string {
+export function exprFor(
+  ir: GraphIR,
+  node: IRNode,
+  fnNames: ReadonlyMap<string, string> = new Map(),
+): string {
   switch (node.op) {
     case "Float":
       return floatLit(numParam(node.params["value"], 0));
@@ -163,6 +167,32 @@ function exprFor(ir: GraphIR, node: IRNode): string {
       }
       return portRef(ir, src.fromNodeId, src.fromPort);
     }
+    case "FunctionCall": {
+      // Emit the invocation. Arguments bind by port name (the argument
+      // name); a scalar wire into a vector parameter splats, mirroring
+      // HLSL's implicit scalar-to-vector behavior.
+      const name = fnNames.get(node.ref ?? "");
+      if (name === undefined) {
+        throw new Error(`Unknown function reference: ${node.ref ?? node.id}`);
+      }
+      const args: Array<string> = [];
+      for (const [portName, inp] of Object.entries(node.inputs)) {
+        const to = node.inTypes?.[portName] ?? inp.fromType;
+        args.push(withSplat(portRef(ir, inp.fromNodeId, inp.fromPort), inp.fromType, to));
+      }
+      return `${name}(${args.join(", ")})`;
+    }
+    case "FunctionInput":
+      // Transparent: portRef resolves the argument name directly.
+      throw new Error(`FunctionInput emits no expression (${node.id})`);
+    case "FunctionOutput": {
+      // A function body's return value: splat to the declared return type.
+      const src = node.inputs["in"];
+      if (src === undefined) {
+        throw new Error(`Missing input for ${node.id}`);
+      }
+      return withSplat(portRef(ir, src.fromNodeId, src.fromPort), src.fromType, node.outType);
+    }
     case "FragmentOutput": {
       const src = node.inputs["color"];
       if (src === undefined) {
@@ -208,6 +238,10 @@ export function portRef(ir: GraphIR, fromNodeId: string, fromPort: string): stri
       return swizzleRead(base, (idx - 1) as 0 | 1 | 2 | 3);
     }
   }
+  if (node.op === "FunctionInput") {
+    // Inside a function body the argument name itself is the expression.
+    return fromPort;
+  }
   if (
     node.op === "Reroute" ||
     node.op === "NamedRerouteDeclaration" ||
@@ -234,8 +268,11 @@ function withSplat(varExpr: string, from: HlslType, to: HlslType): string {
   throw new Error(`Cannot convert ${from} to ${to}`);
 }
 
-export function emitHLSL(ir: GraphIR): string {
-  const lines: Array<string> = [];
+// Scan an IR for the global declarations it needs: texture/sampler pairs,
+// engine-bound uniforms, and whether the sRGB helper is required. Shared by
+// the main-graph emitter and Material Function emission so declarations can
+// be hoisted and deduped at global scope.
+export function collectDecls(ir: GraphIR): { decls: Array<string>; needsSrgbHelper: boolean } {
   const decls: Array<string> = [];
   let needsNormalUniform = false;
   let needsObjectTransform = false;
@@ -243,22 +280,6 @@ export function emitHLSL(ir: GraphIR): string {
   let needsCameraUniforms = false;
   let needsSrgbHelper = false;
   for (const node of ir.nodes) {
-    if (node.op === "FragmentOutput") {
-      continue;
-    }
-    if (
-      node.op === "Reroute" ||
-      node.op === "NamedRerouteDeclaration" ||
-      node.op === "NamedRerouteUsage"
-    ) {
-      // Transparent: no variable, consumers reference the upstream directly.
-      continue;
-    }
-    if (node.op === "Camera") {
-      // Transparent: consumers reference the camera uniforms per port.
-      needsCameraUniforms = true;
-      continue;
-    }
     if (node.op === "SampleTexture2D") {
       decls.push(`Texture2D ${texName(node)};`, `SamplerState ${samplerName(node)};`);
       if (enumParam(node, "Space", 0) === 1) {
@@ -273,8 +294,9 @@ export function emitHLSL(ir: GraphIR): string {
       }
     } else if (node.op === "MainLightDirection") {
       needsLightUniform = true;
+    } else if (node.op === "Camera") {
+      needsCameraUniforms = true;
     }
-    lines.push(`${node.outType} ${node.variable} = ${exprFor(ir, node)};`);
   }
   if (needsCameraUniforms) {
     decls.push("float3 _CameraPosition;", "float3 _CameraDirection;");
@@ -288,6 +310,58 @@ export function emitHLSL(ir: GraphIR): string {
   if (needsLightUniform) {
     decls.push("float3 _MainLightDirection;");
   }
+  return { decls, needsSrgbHelper };
+}
+
+// Statement lines for every non-transparent IR node (no entry point, no
+// indentation, no declarations). fnNames resolves FunctionCall references.
+export function emitBody(
+  ir: GraphIR,
+  fnNames: ReadonlyMap<string, string> = new Map(),
+): Array<string> {
+  const lines: Array<string> = [];
+  for (const node of ir.nodes) {
+    if (
+      node.op === "FragmentOutput" ||
+      node.op === "FunctionOutput" ||
+      node.op === "FunctionInput" ||
+      node.op === "Camera" ||
+      node.op === "Reroute" ||
+      node.op === "NamedRerouteDeclaration" ||
+      node.op === "NamedRerouteUsage"
+    ) {
+      // Transparent: no variable, consumers reference the upstream directly.
+      continue;
+    }
+    lines.push(`${node.outType} ${node.variable} = ${exprFor(ir, node, fnNames)};`);
+  }
+  return lines;
+}
+
+// The main() entry point block (with trailing blank line), indented and
+// closed. fnNames resolves FunctionCall references.
+export function emitEntryPoint(
+  ir: GraphIR,
+  fnNames: ReadonlyMap<string, string> = new Map(),
+): Array<string> {
+  const out = ir.nodes.find((n) => n.id === ir.outputNodeId);
+  if (out === undefined) {
+    throw new Error("IR has no output node");
+  }
+  const lines = [
+    ...emitBody(ir, fnNames),
+    `float4 ${ir.outputVar} = ${exprFor(ir, out, fnNames)};`,
+    `return ${ir.outputVar};`,
+  ];
+  // A pixel shader needs an entry point whose return carries the SV_Target
+  // semantic (the render target output). `main` is the default entry-point
+  // name for fxc and dxc, so the file compiles without extra flags.
+  const body = lines.map((line) => `    ${line}`);
+  return ["float4 main() : SV_Target", "{", ...body, "}", ""];
+}
+
+export function emitHLSL(ir: GraphIR, fnNames: ReadonlyMap<string, string> = new Map()): string {
+  const { decls, needsSrgbHelper } = collectDecls(ir);
   // External bindings first, then helper functions, then the entry point.
   const preamble: Array<string> = [];
   if (decls.length > 0) {
@@ -296,15 +370,5 @@ export function emitHLSL(ir: GraphIR): string {
   if (needsSrgbHelper) {
     preamble.push(SRGB_TO_LINEAR);
   }
-  const out = ir.nodes.find((n) => n.id === ir.outputNodeId);
-  if (out === undefined) {
-    throw new Error("IR has no output node");
-  }
-  lines.push(`float4 ${ir.outputVar} = ${exprFor(ir, out)};`);
-  lines.push(`return ${ir.outputVar};`);
-  // A pixel shader needs an entry point whose return carries the SV_Target
-  // semantic (the render target output). `main` is the default entry-point
-  // name for fxc and dxc, so the file compiles without extra flags.
-  const body = lines.map((line) => `    ${line}`);
-  return [...preamble, "float4 main() : SV_Target", "{", ...body, "}", ""].join("\n");
+  return [...preamble, ...emitEntryPoint(ir, fnNames)].join("\n");
 }

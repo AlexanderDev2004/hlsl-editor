@@ -83,6 +83,10 @@ export const Message = defineMessageUnion({
   AlignedNodes: { mode: Schema.String },
   DistributedNodes: { axis: Schema.String },
   CollapsedSelection: {},
+  // Extract the selected nodes into a Material Function: the selection is
+  // replaced by one FunctionCall node whose ports mirror the new function's
+  // signature.
+  RequestedCreateFunction: {},
   ExpandedCollapsed: { collapsedId: Schema.String },
   RenamedCollapsed: { collapsedId: Schema.String, name: Schema.String },
   SelectedCollapsed: { collapsedId: Schema.String },

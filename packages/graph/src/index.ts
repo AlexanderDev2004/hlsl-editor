@@ -19,6 +19,8 @@ export interface Port {
   valueType: string;
   required: boolean;
   defaultValue?: number | Array<number>;
+  /** Compatible source types; the compiler defaults to [valueType]. */
+  accepts?: ReadonlyArray<string>;
 }
 
 export interface GraphNode {
@@ -27,6 +29,8 @@ export interface GraphNode {
   position: Vec2;
   ports: Array<Port>;
   params: Record<string, number | Array<number>>;
+  /** For FunctionCall nodes: the id of the FunctionDef this node invokes. */
+  ref?: string;
 }
 
 export interface EdgeEndpoint {

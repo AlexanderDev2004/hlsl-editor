@@ -9,7 +9,7 @@ import {
   resolveOutputType,
   type NodeType,
 } from "@hlsl-editor/shader-nodes";
-import type { HlslType } from "@hlsl-editor/shader-types";
+import { isMvp1Type, type HlslType } from "@hlsl-editor/shader-types";
 
 import { upstreamPortType } from "./validate";
 
@@ -24,6 +24,11 @@ export interface IRNode {
   params: Record<string, number | Array<number>>;
   // Assigned variable name (_0, _1, ...) in deterministic topo order.
   variable: string;
+  // FunctionCall only: the invoked FunctionDef id.
+  ref?: string;
+  // FunctionCall only: the target type of each argument port (the declared
+  // parameter type), so emission can splat a scalar wire up to the vector.
+  inTypes?: Record<string, HlslType>;
 }
 
 export interface GraphIR {
@@ -38,8 +43,11 @@ export function toIR(graph: Graph): GraphIR {
     throw new Error("Cannot build IR without an output node");
   }
   const outputNode = graph.nodes.find((n) => n.id === graph.outputNodeId);
-  if (outputNode === undefined || outputNode.type !== "FragmentOutput") {
-    throw new Error("Output node must be a FragmentOutput");
+  if (
+    outputNode === undefined ||
+    (outputNode.type !== "FragmentOutput" && outputNode.type !== "FunctionOutput")
+  ) {
+    throw new Error("Output node must be a FragmentOutput or FunctionOutput");
   }
 
   // Reachable set via reverse walk from output (dependencies only).
@@ -92,9 +100,16 @@ export function toIR(graph: Graph): GraphIR {
     if (node === undefined || !isNodeType(node.type)) {
       continue;
     }
-    // Transparent nodes (reroutes, the camera, the output) emit no
-    // variable, so the numbering downstream matches a graph without them.
-    if (node.type === "FragmentOutput" || node.type === "Camera" || isRerouteType(node.type)) {
+    // Transparent nodes (reroutes, the camera, the output, function
+    // internals) emit no variable, so the numbering downstream matches a
+    // graph without them.
+    if (
+      node.type === "FragmentOutput" ||
+      node.type === "FunctionOutput" ||
+      node.type === "FunctionInput" ||
+      node.type === "Camera" ||
+      isRerouteType(node.type)
+    ) {
       continue;
     }
     varOf.set(id, `_${counter}`);
@@ -108,7 +123,11 @@ export function toIR(graph: Graph): GraphIR {
     if (node === undefined || !isNodeType(node.type)) {
       throw new Error(`Invalid node in IR walk: ${id}`);
     }
-    const def_inputs: Array<string> = inputPortNames(node.type);
+    // Input ports come from the node itself, so per-instance ports (e.g.
+    // FunctionCall arguments) resolve exactly like registry ports.
+    const def_inputs: Array<string> = node.ports
+      .filter((p) => p.direction === "in")
+      .map((p) => p.name);
     const inputs: IRNode["inputs"] = {};
     for (const name of def_inputs) {
       const edge = incomingEdge(graph, id, name);
@@ -121,7 +140,19 @@ export function toIR(graph: Graph): GraphIR {
       }
     }
     const outType =
-      node.type === "FragmentOutput" ? ("float4" as HlslType) : resolveNodeOutType(graph, id);
+      node.type === "FragmentOutput"
+        ? ("float4" as HlslType)
+        : node.type === "FunctionOutput"
+          ? functionReturnType(graph, id)
+          : resolveNodeOutType(graph, id);
+    const inTypes: Record<string, HlslType> = {};
+    if (node.type === "FunctionCall") {
+      for (const p of node.ports) {
+        if (p.direction === "in" && isMvp1Type(p.valueType)) {
+          inTypes[p.name] = p.valueType;
+        }
+      }
+    }
     nodes.push({
       id,
       op: node.type,
@@ -129,45 +160,25 @@ export function toIR(graph: Graph): GraphIR {
       inputs,
       params: node.params,
       variable: varOf.get(id) ?? "",
+      ...(node.ref !== undefined ? { ref: node.ref } : {}),
+      ...(node.type === "FunctionCall" ? { inTypes } : {}),
     });
   }
 
   return { nodes, outputNodeId: outputNode.id, outputVar };
 }
 
-function inputPortNames(type: NodeType): Array<string> {
-  switch (type) {
-    case "Float":
-    case "Float2":
-    case "Float3":
-    case "Float4":
-      return [];
-    case "Add":
-    case "Subtract":
-    case "Multiply":
-    case "Divide":
-    case "DotProduct":
-      return ["a", "b"];
-    case "Split":
-    case "Preview":
-      return ["in"];
-    case "Combine":
-      return ["x", "y", "z", "w"];
-    case "SampleTexture2D":
-      return ["UV"];
-    case "SampleCubemap":
-      return ["Dir"];
-    case "NormalVector":
-    case "MainLightDirection":
-    case "Camera":
-      return [];
-    case "Reroute":
-    case "NamedRerouteDeclaration":
-    case "NamedRerouteUsage":
-      return ["in"];
-    case "FragmentOutput":
-      return ["color"];
+// A FunctionOutput's return type is the type of whatever feeds its input.
+function functionReturnType(graph: Graph, nodeId: string): HlslType {
+  const edge = incomingEdge(graph, nodeId, "in");
+  if (edge === undefined) {
+    throw new Error(`FunctionOutput has no input (${nodeId})`);
   }
+  const t = upstreamPortType(graph, edge.source.nodeId, edge.source.port);
+  if (t === null) {
+    throw new Error(`Cannot resolve function return type (${nodeId})`);
+  }
+  return t;
 }
 
 function resolveNodeOutType(graph: Graph, nodeId: string): HlslType {
@@ -216,6 +227,14 @@ function resolveNodeOutType(graph: Graph, nodeId: string): HlslType {
       throw new Error(`Cannot resolve output type for ${nodeId}`);
     }
     return resolved;
+  }
+  // Function nodes carry their output type on the per-instance out port.
+  if (node.type === "FunctionInput" || node.type === "FunctionCall") {
+    const outPort = node.ports.find((p) => p.direction === "out");
+    if (outPort === undefined || !isMvp1Type(outPort.valueType)) {
+      throw new Error(`Cannot resolve output type for ${nodeId}`);
+    }
+    return outPort.valueType;
   }
   const t = upstreamPortType(graph, nodeId, "out");
   if (t === null) {

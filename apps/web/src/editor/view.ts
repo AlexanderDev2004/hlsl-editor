@@ -36,6 +36,7 @@ import {
   ZOOM_MAX,
   ZOOM_MIN,
   nodeHeight,
+  nodeHeightFor,
   nodeWidth,
   portY,
 } from './layout'
@@ -52,9 +53,11 @@ import {
   type CollapsedNode,
   type EditorEdge,
   type EditorNode,
+  type EditorPortDef,
   type Group,
   type LogEntry,
   type Model,
+  toDomainFunctions,
   toDomainGraph,
 } from './model'
 import {
@@ -83,8 +86,7 @@ function portPosition(
   if (!isNodeType(node.type)) {
     return null
   }
-  const def = NODE_REGISTRY[node.type]
-  const list = direction === 'in' ? def.inputs : def.outputs
+  const list = direction === 'in' ? nodeInputDefs(node) : nodeOutputDefs(node)
   const index = list.findIndex(p => p.name === portName)
   if (index < 0) {
     return null
@@ -154,9 +156,31 @@ function categoryColor(category: string): string {
 
 // Named reroute declarations/usages are created through the reroute actions,
 // never dropped in standalone (a lone usage has no declaration to link to).
+// Function nodes are created by extracting a selection, never from the
+// palette.
 const PALETTE_TYPES = NODE_TYPES.filter(
-  type => type !== 'NamedRerouteDeclaration' && type !== 'NamedRerouteUsage',
+  type =>
+    type !== 'NamedRerouteDeclaration' &&
+    type !== 'NamedRerouteUsage' &&
+    type !== 'FunctionCall' &&
+    type !== 'FunctionInput' &&
+    type !== 'FunctionOutput',
 )
+
+// Instance ports (on function nodes) replace the registry's port lists.
+function nodeInputDefs(node: EditorNode): ReadonlyArray<EditorPortDef> {
+  if (node.ports !== undefined) {
+    return node.ports.filter(p => p.direction === 'in')
+  }
+  return isNodeType(node.type) ? NODE_REGISTRY[node.type].inputs : []
+}
+
+function nodeOutputDefs(node: EditorNode): ReadonlyArray<EditorPortDef> {
+  if (node.ports !== undefined) {
+    return node.ports.filter(p => p.direction === 'out')
+  }
+  return isNodeType(node.type) ? NODE_REGISTRY[node.type].outputs : []
+}
 
 function typeColor(type: string): string {
   return TYPE_COLORS[type] ?? '#8b949e'
@@ -256,9 +280,7 @@ function resolvedSourceType(
     if (!isNodeType(source.type)) {
       return null
     }
-    const port = NODE_REGISTRY[source.type].outputs.find(
-      o => o.name === edge.sourcePort,
-    )
+    const port = nodeOutputDefs(source).find(o => o.name === edge.sourcePort)
     return port === undefined ? null : port.valueType
   }
   const upstream = model.edges.find(
@@ -308,8 +330,9 @@ function highlightedNodeIds(model: Model): ReadonlySet<string> {
 
 export const view = (model: Model, h: HtmlBuilder<Message>): Document => {
   const graph = toDomainGraph(model)
+  const functions = toDomainFunctions(model.functions)
   const errors = validate(graph)
-  const result = generate(graph)
+  const result = generate(graph, { functions })
   const errorNodes = new Set(
     errors.flatMap(e => (e.nodeId !== undefined ? [e.nodeId] : [])),
   )
@@ -591,6 +614,12 @@ function headerView(
             'Collapse',
             Message.CollapsedSelection(),
             'Collapse selected nodes into a container',
+          ),
+          headerToolButton(
+            h,
+            'Create Function',
+            Message.RequestedCreateFunction(),
+            'Extract the selected nodes into a Material Function',
           ),
           h.div([h.Class(HEADER_DIVIDER)]),
           h.span(
@@ -2219,15 +2248,19 @@ function nodeView(
     return rerouteNodeView(model, h, node, status, highlighted)
   }
   const selected = model.selectedNodeIds.includes(node.id)
-  const height = nodeHeight(node.type)
-  const label = isNodeType(node.type)
-    ? NODE_REGISTRY[node.type].label
-    : node.type
+  const height = nodeHeightFor(node.type, node.ports)
+  const fnName =
+    node.type === 'FunctionCall'
+      ? model.functions.find(f => f.id === node.ref)?.name
+      : undefined
+  const label =
+    fnName ??
+    (isNodeType(node.type) ? NODE_REGISTRY[node.type].label : node.type)
   const category = isNodeType(node.type)
     ? NODE_REGISTRY[node.type].category
     : 'Utility'
-  const inputs = isNodeType(node.type) ? NODE_REGISTRY[node.type].inputs : []
-  const outputs = isNodeType(node.type) ? NODE_REGISTRY[node.type].outputs : []
+  const inputs = nodeInputDefs(node)
+  const outputs = nodeOutputDefs(node)
   const emphasised = status === 'error' || status === 'warning'
   const headerColor =
     status === 'error'
@@ -2479,7 +2512,7 @@ function nodeView(
           ]),
         ]
       }),
-      node.type === 'Preview' ? previewSwatch(graph, h, node) : h.empty,
+      node.type === 'Preview' ? previewSwatch(model, graph, h, node) : h.empty,
       nodeStatusIndicator(h, status, model.loadingVariant, NODE_W, height),
     ],
   )
@@ -2491,6 +2524,7 @@ function nodeView(
 // Scene/GPU-dependent values and broken graphs get an explicit
 // "unavailable" state instead of an invented color.
 function previewSwatch(
+  model: Model,
   graph: Graph,
   h: HtmlBuilder<Message>,
   node: EditorNode,
@@ -2505,7 +2539,9 @@ function previewSwatch(
     h.Class('node-preview'),
     h.PointerEvents('none'),
   ]
-  const result = evaluateNode(graph, node.id)
+  const result = evaluateNode(graph, node.id, {
+    functions: toDomainFunctions(model.functions),
+  })
   if (!result.ok) {
     return h.rect([
       ...geometry,

@@ -20,6 +20,9 @@ export const NODE_TYPES = [
   "Reroute",
   "NamedRerouteDeclaration",
   "NamedRerouteUsage",
+  "FunctionInput",
+  "FunctionOutput",
+  "FunctionCall",
   "FragmentOutput",
   "Preview",
   "SampleTexture2D",
@@ -71,6 +74,7 @@ function port(nodeId: string, def: PortDef): Port {
     direction: def.direction,
     valueType: def.valueType,
     required: def.required,
+    ...(def.accepts !== undefined ? { accepts: def.accepts } : {}),
   };
 }
 
@@ -367,12 +371,51 @@ export const NODE_REGISTRY: Record<NodeType, NodeDefinition> = {
     outputs: PASSTHROUGH_OUTPUT,
     defaultParams: {},
   },
+  // Material Function internals. A FunctionInput node's single out port is
+  // per-instance: its name is the argument name and its valueType is the
+  // argument type. FunctionOutput marks the function's return value.
+  FunctionInput: {
+    type: "FunctionInput",
+    label: "Function Input",
+    category: "Utility",
+    inputs: [],
+    outputs: [{ name: "value", direction: "out", valueType: "float", required: false }],
+    defaultParams: {},
+  },
+  FunctionOutput: {
+    type: "FunctionOutput",
+    label: "Function Output",
+    category: "Output",
+    inputs: ANY_INPUT,
+    outputs: [],
+    defaultParams: {},
+  },
+  // Invoke node created by "Create Material Function". Its real ports are
+  // per-instance (one input per argument, one output of the return type);
+  // the registry entry only supplies the placeholder shape.
+  FunctionCall: {
+    type: "FunctionCall",
+    label: "Function Call",
+    category: "Utility",
+    inputs: [],
+    outputs: [{ name: "out", direction: "out", valueType: "float", required: false }],
+    defaultParams: {},
+  },
 };
 
 export const REROUTE_TYPES: ReadonlyArray<NodeType> = [
   "Reroute",
   "NamedRerouteDeclaration",
   "NamedRerouteUsage",
+];
+
+// Node kinds that only exist inside a Material Function definition. They are
+// never created from the palette; extraction creates them, and the editor
+// excludes them from Add menus.
+export const FUNCTION_NODE_TYPES: ReadonlyArray<NodeType> = [
+  "FunctionInput",
+  "FunctionOutput",
+  "FunctionCall",
 ];
 
 export function isRerouteType(type: string): boolean {
@@ -453,6 +496,12 @@ export function resolveOutputType(
     case "NamedRerouteUsage":
       return inputTypes["in"] ?? null;
     case "FragmentOutput":
+    case "FunctionOutput":
+      return null;
+    // FunctionInput and FunctionCall carry per-instance ports; their output
+    // type lives on the GraphNode, not in the registry.
+    case "FunctionInput":
+    case "FunctionCall":
       return null;
   }
 }

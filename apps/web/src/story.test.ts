@@ -2,7 +2,7 @@ import { Option } from 'effect'
 import { Command, given, message, model, story } from 'foldkit/story'
 import { describe, expect, test } from 'vitest'
 
-import { validate } from '@hlsl-editor/shader-compiler'
+import { generate, validate } from '@hlsl-editor/shader-compiler'
 
 import { PersistSettings } from './editor/commands'
 import {
@@ -11,6 +11,7 @@ import {
   deriveNodeStatuses,
   emptyModel,
   seedModel,
+  toDomainFunctions,
   toDomainGraph,
   update,
 } from './main'
@@ -1676,6 +1677,247 @@ describe('texture and scene nodes', () => {
         expect(sample?.params['Type']).toBe(1)
         expect(m.logs[0]?.level).toBe('info')
         expect(m.logs[0]?.text).toContain('Set n5.Type to 1')
+      }),
+    )
+  })
+})
+
+describe('material functions', () => {
+  test('RequestedCreateFunction extracts the selection into a FunctionCall', () => {
+    story(
+      update,
+      given({ ...seedModel(), selectedNodeIds: ['n3'] }),
+      message(Message.RequestedCreateFunction()),
+      Command.expectNone(),
+      model((m: Model) => {
+        // Multiply (n3) was replaced by the call node n5; n1/n2/n4 stay.
+        expect(m.nodes.map(n => n.id).sort()).toEqual(['n1', 'n2', 'n4', 'n5'])
+        const call = m.nodes.find(n => n.type === 'FunctionCall')
+        expect(call?.ref).toBe('f1')
+        expect(call?.ports?.map(p => `${p.direction}:${p.name}`)).toEqual([
+          'in:a',
+          'in:b',
+          'out:out',
+        ])
+        expect(m.functions).toHaveLength(1)
+        expect(m.functions[0]?.name).toBe('Fn1')
+        // The argument edges were retargeted to the call node and its output
+        // feeds the Fragment Output exactly like the old edge did.
+        expect(
+          m.edges.some(e => e.targetNodeId === 'n5' && e.targetPort === 'a'),
+        ).toBe(true)
+        expect(
+          m.edges.some(e => e.targetNodeId === 'n5' && e.targetPort === 'b'),
+        ).toBe(true)
+        expect(
+          m.edges.some(e => e.sourceNodeId === 'n5' && e.targetNodeId === 'n4'),
+        ).toBe(true)
+        expect(m.selectedNodeIds).toEqual(['n5'])
+        expect(m.logs[0]?.level).toBe('success')
+        // The regenerated graph compiles with the function in scope.
+        expect(
+          generate(toDomainGraph(m), {
+            functions: toDomainFunctions(m.functions),
+          }).ok,
+        ).toBe(true)
+      }),
+    )
+  })
+
+  test('extraction requires an outgoing wire', () => {
+    const base = seedModel()
+    const loneFloat = {
+      ...base,
+      nodes: [
+        {
+          id: 'n1',
+          type: 'Float',
+          position: { x: 0, y: 0 },
+          params: { value: 1 },
+        },
+      ],
+      edges: [],
+      outputNodeId: Option.none(),
+    }
+    story(
+      update,
+      given({ ...loneFloat, selectedNodeIds: ['n1'] }),
+      message(Message.RequestedCreateFunction()),
+      model((m: Model) => {
+        expect(m.functions).toHaveLength(0)
+        expect(m.status).toContain('no outgoing wire')
+      }),
+    )
+  })
+
+  test('the Fragment Output cannot be extracted', () => {
+    story(
+      update,
+      given({ ...seedModel(), selectedNodeIds: ['n4'] }),
+      message(Message.RequestedCreateFunction()),
+      model((m: Model) => {
+        expect(m.functions).toHaveLength(0)
+        expect(m.status).toContain('Fragment Output')
+      }),
+    )
+  })
+
+  test('undo restores the pre-function graph', () => {
+    story(
+      update,
+      given({ ...seedModel(), selectedNodeIds: ['n3'] }),
+      message(Message.RequestedCreateFunction()),
+      message(Message.PressedUndo()),
+      model((m: Model) => {
+        expect(m.functions).toHaveLength(0)
+        expect(m.nodes.some(n => n.id === 'n3')).toBe(true)
+        expect(m.nodes.some(n => n.type === 'FunctionCall')).toBe(false)
+      }),
+    )
+  })
+
+  test('a saved v2 graph reloads with its functions', () => {
+    const text = JSON.stringify({
+      version: 2,
+      nodes: [
+        {
+          id: 'n1',
+          type: 'Float',
+          position: { x: 0, y: 0 },
+          params: { value: 2 },
+        },
+        {
+          id: 'n9',
+          type: 'FunctionCall',
+          position: { x: 200, y: 0 },
+          params: {},
+          ref: 'f9',
+          ports: [
+            { name: 'a', direction: 'in', valueType: 'float', required: true },
+            {
+              name: 'out',
+              direction: 'out',
+              valueType: 'float',
+              required: false,
+            },
+          ],
+        },
+        {
+          id: 'n2',
+          type: 'FragmentOutput',
+          position: { x: 500, y: 0 },
+          params: {},
+        },
+      ],
+      edges: [
+        {
+          id: 'e1',
+          source: { nodeId: 'n1', port: 'out' },
+          target: { nodeId: 'n9', port: 'a' },
+        },
+        {
+          id: 'e2',
+          source: { nodeId: 'n9', port: 'out' },
+          target: { nodeId: 'n2', port: 'color' },
+        },
+      ],
+      outputNodeId: 'n2',
+      functions: [
+        {
+          id: 'f9',
+          name: 'Fn9',
+          nodes: [
+            {
+              id: 'fa',
+              type: 'FunctionInput',
+              position: { x: 0, y: 0 },
+              params: {},
+              ports: [
+                {
+                  name: 'a',
+                  direction: 'out',
+                  valueType: 'float',
+                  required: false,
+                },
+              ],
+            },
+            {
+              id: 'fb',
+              type: 'FunctionOutput',
+              position: { x: 200, y: 0 },
+              params: {},
+            },
+          ],
+          edges: [
+            {
+              id: 'fe1',
+              source: { nodeId: 'fa', port: 'a' },
+              target: { nodeId: 'fb', port: 'in' },
+            },
+          ],
+        },
+      ],
+    })
+    story(
+      update,
+      given(emptyModel()),
+      message(Message.CompletedLoadGraph({ json: text })),
+      Command.expectNone(),
+      model((m: Model) => {
+        expect(m.functions).toHaveLength(1)
+        expect(m.functions[0]?.name).toBe('Fn9')
+        expect(
+          m.functions[0]?.nodes.some(n => n.type === 'FunctionInput'),
+        ).toBe(true)
+        const call = m.nodes.find(n => n.type === 'FunctionCall')
+        expect(call?.ref).toBe('f9')
+        expect(call?.ports?.some(p => p.name === 'a')).toBe(true)
+        // Next counters pick up after what was imported.
+        expect(m.nextFunction).toBe(10)
+        expect(
+          generate(toDomainGraph(m), {
+            functions: toDomainFunctions(m.functions),
+          }).ok,
+        ).toBe(true)
+      }),
+    )
+  })
+
+  test('v1 imports still load (functions empty)', () => {
+    const text = JSON.stringify({
+      version: 1,
+      nodes: [
+        {
+          id: 'n1',
+          type: 'Float',
+          position: { x: 0, y: 0 },
+          params: { value: 1 },
+        },
+        {
+          id: 'n2',
+          type: 'FragmentOutput',
+          position: { x: 300, y: 0 },
+          params: {},
+        },
+      ],
+      edges: [
+        {
+          id: 'e1',
+          source: { nodeId: 'n1', port: 'out' },
+          target: { nodeId: 'n2', port: 'color' },
+        },
+      ],
+      outputNodeId: 'n2',
+    })
+    story(
+      update,
+      given(emptyModel()),
+      message(Message.CompletedLoadGraph({ json: text })),
+      Command.expectNone(),
+      model((m: Model) => {
+        expect(m.functions).toEqual([])
+        expect(m.nextFunction).toBe(1)
+        expect(m.nodes).toHaveLength(2)
       }),
     )
   })
